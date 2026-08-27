@@ -430,6 +430,14 @@ def main() -> int:
     ap.add_argument("--resume", default="auto",
                     help="'auto' continues from <out-dir>/last.pt if it exists, "
                          "'none' starts fresh, or a path to a checkpoint")
+    ap.add_argument("--vram-fraction", type=float, default=0.85,
+                    help="cap the share of VRAM this process may allocate. On "
+                         "Windows the driver does NOT fail when VRAM runs out - "
+                         "it silently spills into system RAM over PCIe, which "
+                         "does not raise, does not log, and can take the machine "
+                         "into swap while looking like a merely slow run. The "
+                         "cap turns that into a real OutOfMemoryError, which is "
+                         "what the batch halving is waiting for. 0 disables it")
     ap.add_argument("--amp", action="store_true",
                     help="mixed precision. Off by default: it halves memory and "
                          "it also changes the numerics, and this model's loss "
@@ -463,6 +471,14 @@ def main() -> int:
 
     device = torch.device(args.device or
                           ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda" and args.vram_fraction > 0:
+        # Without this a run does not fail when it runs out of VRAM: it gets
+        # slower, the machine starts swapping, and nothing says so.
+        torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
+        total = torch.cuda.get_device_properties(0).total_memory
+        print(f"VRAM cap {args.vram_fraction:.0%} of {total / 1e9:.1f} GB = "
+              f"{args.vram_fraction * total / 1e9:.1f} GB - past it the run "
+              f"raises instead of spilling into system RAM")
     p = ModelParams()
     df_state = DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size,
                   nb_bands=p.nb_erb, min_nb_erb_freqs=p.min_nb_freqs)
@@ -710,6 +726,10 @@ def main() -> int:
         if stopping["now"]:
             print("stopped early; last.pt holds the current state")
             break
+
+    if device.type == "cuda":
+        print()
+        print(f"peak VRAM: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
     if oom.events:
         print("\nmemory pressure during this run:")
