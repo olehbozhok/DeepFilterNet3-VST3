@@ -135,11 +135,35 @@ against its own PyTorch original without touching the plugin at all. Ours agreed
 at correlation 0.989-0.993 with zero lag and levels within 0.3 dB; the residual
 is tract's operation order, not a difference in weights.
 
-The plugin will then load it from a path or from a buffer:
+The plugin can take it three ways.
+
+**At run time**, without rebuilding - the loop for comparing models by ear:
 
 ```bash
 DEEPFILTER_MODEL=<path-to>_onnx.tar.gz   # then start the host
 ```
+
+**Compiled in**, for shipping one:
+
+```bash
+DEEPFILTER_EMBED_MODEL=<path-to>_onnx.tar.gz   cargo build --release -p deepfilter-vst   --no-default-features --features model-embedded
+```
+
+The archive does not have to live in this repository - the path is read at build
+time, and `build.rs` marks both the variable and the file as build inputs, so
+retraining the model rebuilds the plugin instead of leaving stale weights behind
+a fresh path.
+
+**With no model at all**, which then requires `DEEPFILTER_MODEL`:
+
+```bash
+cargo build --release -p deepfilter-vst --no-default-features
+```
+
+Two embedded models at once is a compile error. A build with none refuses to
+construct an engine and says so; it never falls back to another model, because a
+plugin that quietly passes audio through something nobody chose makes every
+listening judgement after it worthless.
 
 An environment variable rather than a control in the editor, because the editor
 is specified to carry exactly two parameter sliders and a model chooser is not a

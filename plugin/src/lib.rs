@@ -1,8 +1,19 @@
-#[cfg(all(feature = "model-ll", feature = "model-standard"))]
-compile_error!("exactly one DeepFilterNet model feature must be enabled");
-
-#[cfg(not(any(feature = "model-ll", feature = "model-standard")))]
-compile_error!("exactly one DeepFilterNet model feature must be enabled");
+// AT MOST one embedded model. Two would put a model in the binary that nobody
+// asked for, and since the standard and low-latency variants have different
+// lookahead, the plugin could report the wrong latency to the host.
+//
+// ZERO is now legal, and it is a deliberate build shape: the plugin then loads
+// its model from DEEPFILTER_MODEL at run time and refuses to start without one.
+// That is the build for shipping a fine-tuned model that should not be baked in,
+// and for comparing two of them without recompiling between.
+#[cfg(any(
+    all(feature = "model-ll", feature = "model-standard"),
+    all(feature = "model-ll", feature = "model-embedded"),
+    all(feature = "model-standard", feature = "model-embedded"),
+))]
+compile_error!(
+    "enable at most one of model-ll, model-standard, model-embedded"
+);
 
 mod bridge;
 mod dsp;

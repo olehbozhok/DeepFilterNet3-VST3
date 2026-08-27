@@ -16,10 +16,20 @@ Project instructions for coding agents working in this repository.
 ## DSP and build invariants
 
 - Use nice-plug and nice-plug-xtask. Do not reintroduce nih-plug.
-- Enable exactly one embedded model feature. The default is `model-ll`, and
-  the alternate build is `--no-default-features --features model-standard`.
-  Keep DeepFilterNet default features disabled so both models are never
-  embedded together.
+- Enable AT MOST one embedded model feature; a build with none is legal and
+  deliberate. The default is `model-ll`; the alternates are
+  `--no-default-features --features model-standard`,
+  `--no-default-features --features model-embedded` (compiles in the archive
+  named by `DEEPFILTER_EMBED_MODEL` at build time), and `--no-default-features`
+  alone, which carries no model and requires `DEEPFILTER_MODEL` at run time.
+  Two at once is a compile error: the variants differ in lookahead, so a binary
+  holding both could report the wrong latency to the host.
+- A build with no model must FAIL to construct an engine, with a message naming
+  `DEEPFILTER_MODEL`. It must never fall back to another model: a plugin that
+  silently passes audio through something nobody chose makes every listening
+  judgement afterwards worthless. Note that `DfParams::default()` PANICS when
+  DeepFilterNet itself was built without a model, which is why that call is
+  compiled only into the shapes that have one.
 - Keep `DfTract`, model reconstruction, and persistent rubato converters on
   the worker. The audio callback must not allocate, lock, wait, log, call the
   model, or call a resampler.

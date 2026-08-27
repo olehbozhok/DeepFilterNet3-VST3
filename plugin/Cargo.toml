@@ -2,6 +2,7 @@
 name = "deepfilter-vst"
 version = "0.6.0"
 edition = "2021"
+build = "build.rs"
 license = "MIT"
 
 [lib]
@@ -9,8 +10,13 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["model-ll"]
+# Exactly one of these, or none. `model-embedded` compiles in a model of our own
+# from the path in DEEPFILTER_EMBED_MODEL, and pulls in no DeepFilterNet model
+# feature at all, so the two are never both present. With none of them the
+# plugin carries no model and requires DEEPFILTER_MODEL at run time.
 model-ll = ["df/default-model-ll"]
 model-standard = ["df/default-model"]
+model-embedded = []
 
 [dependencies]
 nice-plug = "=0.2.3"

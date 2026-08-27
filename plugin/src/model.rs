@@ -7,6 +7,38 @@ use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
 use std::path::{Path, PathBuf};
 
+// Exactly one embedded model, or none. Two would mean the binary carries a
+// model nobody asked for and the plugin's own report of its latency could
+// describe the wrong one.
+#[cfg(any(
+    all(feature = "model-ll", feature = "model-standard"),
+    all(feature = "model-ll", feature = "model-embedded"),
+    all(feature = "model-standard", feature = "model-embedded"),
+))]
+compile_error!(
+    "enable at most one of model-ll, model-standard, model-embedded -      the default build is model-ll, and any other needs --no-default-features"
+);
+
+/// The archive compiled into this build, if any.
+///
+/// `model-embedded` takes the path from DEEPFILTER_EMBED_MODEL at COMPILE time,
+/// so a fine-tuned model can be shipped inside the plugin without the archive
+/// having to live in this repository. build.rs marks both the variable and the
+/// file it names as build inputs, so retraining the model rebuilds the plugin
+/// rather than leaving stale weights behind a fresh path.
+#[cfg(feature = "model-embedded")]
+const EMBEDDED_MODEL: &[u8] = include_bytes!(env!(
+    "DEEPFILTER_EMBED_MODEL",
+    "building with --features model-embedded requires DEEPFILTER_EMBED_MODEL      to name a *_onnx.tar.gz produced by DeepFilterNet's export.py"
+));
+
+/// Whether this build carries a model at all.
+pub(crate) const HAS_EMBEDDED_MODEL: bool = cfg!(any(
+    feature = "model-ll",
+    feature = "model-standard",
+    feature = "model-embedded"
+));
+
 /// Fixed timing expected by the embedded official DeepFilterNet model.
 pub(crate) const MODEL_SAMPLE_RATE: usize = 48_000;
 pub(crate) const MODEL_HOP_SIZE: usize = 480;
@@ -107,9 +139,33 @@ pub(crate) enum ModelSource<'a> {
 /// model chooser is not a mix control. This is a developer's door, not a user's.
 pub(crate) const MODEL_PATH_ENV: &str = "DEEPFILTER_MODEL";
 
+#[cfg(feature = "model-embedded")]
+fn embedded_params() -> Result<DfParams, ModelError> {
+    // Leaked for the same reason as ModelSource::Bytes, except that here the
+    // slice is already 'static - it is in the binary - so nothing is leaked at
+    // all. This is the cheapest of the three paths.
+    DfParams::from_bytes(EMBEDDED_MODEL)
+        .map_err(|error| ModelError::new(format!("the embedded model is unreadable: {error}")))
+}
+
+#[cfg(all(not(feature = "model-embedded"), any(feature = "model-ll", feature = "model-standard")))]
+fn embedded_params() -> Result<DfParams, ModelError> {
+    // DfParams::default() PANICS when DeepFilterNet was built without a model
+    // feature, which is why this function is only compiled when one is present:
+    // an audio plugin must fail as an error, never as a panic.
+    Ok(DfParams::default())
+}
+
+#[cfg(not(any(feature = "model-ll", feature = "model-standard", feature = "model-embedded")))]
+fn embedded_params() -> Result<DfParams, ModelError> {
+    Err(ModelError::new(
+        "this build carries no model. Set DEEPFILTER_MODEL to a *_onnx.tar.gz,          or rebuild with one of --features model-ll / model-standard / model-embedded",
+    ))
+}
+
 fn params_from(source: ModelSource<'_>) -> Result<DfParams, ModelError> {
     match source {
-        ModelSource::Embedded => Ok(DfParams::default()),
+        ModelSource::Embedded => embedded_params(),
         ModelSource::File(path) => DfParams::new(path.clone()).map_err(|error| {
             ModelError::new(format!(
                 "could not read the model at {}: {error}",
@@ -240,7 +296,11 @@ fn sanitized_attenuation(requested: f32) -> f32 {
     }
 }
 
-#[cfg(all(test, feature = "model-ll"))]
+// The module is compiled for EVERY build shape; the tests that need a
+// particular embedded model gate themselves. Gating the whole module on
+// model-ll meant the tests written for the other shapes silently did not
+// exist - they reported "24 passed" while never being built.
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -252,6 +312,48 @@ mod tests {
                     + 0.05 * (phase * 1_731.0 * std::f32::consts::TAU).sin()
             })
             .collect()
+    }
+
+    /// A build with no model must FAIL, and say what to do about it.
+    ///
+    /// The dangerous shape of this bug is not a crash: it is a plugin that
+    /// silently falls back to some other model and passes audio, so every
+    /// listening judgement afterwards is about a model nobody chose.
+    #[cfg(not(any(feature = "model-ll", feature = "model-standard",
+                  feature = "model-embedded")))]
+    #[test]
+    fn a_build_with_no_model_refuses_clearly() {
+        let error = DfEngine::from_source(ModelSource::Embedded)
+            .err()
+            .expect("a build with no model must not construct an engine");
+        let text = error.to_string();
+        assert!(text.contains("DEEPFILTER_MODEL"), "{text}");
+        assert!(text.contains("model-embedded"), "{text}");
+    }
+
+    /// An embedded model must be the one that was named, not a default.
+    ///
+    /// Skipped unless DEEPFILTER_TEST_MODEL names the SAME archive the build
+    /// embedded: the test then asserts that loading it from disk and using the
+    /// compiled-in copy describe the same model. A build that quietly fell back
+    /// to DeepFilterNet's own model would differ in lookahead and fail here.
+    #[cfg(feature = "model-embedded")]
+    #[test]
+    fn the_embedded_model_is_the_one_that_was_named() {
+        let _serial = crate::test_support::serialize_real_model();
+        let embedded = DfEngine::from_source(ModelSource::Embedded)
+            .expect("the embedded model must construct");
+        let Some(path) = std::env::var_os("DEEPFILTER_TEST_MODEL") else {
+            eprintln!("skipped the identity half: set DEEPFILTER_TEST_MODEL to                        the same archive that was embedded");
+            return;
+        };
+        let from_disk = DfEngine::from_path(&PathBuf::from(path))
+            .expect("the same archive must load from disk");
+        assert_eq!(
+            embedded.info(),
+            from_disk.info(),
+            "the compiled-in model does not match the archive it was built from"
+        );
     }
 
     /// An external model has to load, report its own timing, and actually run.
@@ -267,6 +369,7 @@ mod tests {
     /// `*_onnx.tar.gz` to run it.
     #[test]
     fn an_external_model_loads_from_a_path_and_from_bytes() {
+        // Works in any build shape: it never touches the embedded model.
         let Some(path) = std::env::var_os("DEEPFILTER_TEST_MODEL") else {
             eprintln!("skipped: set DEEPFILTER_TEST_MODEL to an exported *_onnx.tar.gz");
             return;
@@ -302,6 +405,7 @@ mod tests {
         assert!(a_nonzero && b_nonzero, "the external model produced only silence");
     }
 
+    #[cfg(feature = "model-ll")]
     #[test]
     fn official_ll_metadata_and_one_channel_shape_are_live() {
         let _serial = crate::test_support::serialize_real_model();
