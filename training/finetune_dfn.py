@@ -130,6 +130,10 @@ class Pair:
     noisy: Path
     snr_db: float = float("nan")
     cutoff_hz: float = float("nan")
+    # What the builder divided the noisy side by to keep it inside the PCM
+    # range. The clean side was NOT divided, so a pair carries a level offset
+    # nothing asked for. See `--undo-peak-scale`.
+    scale: float = 1.0
 
 
 def pairs_from_manifest(data_dir: Path, split: str) -> list[Pair]:
@@ -153,6 +157,7 @@ def pairs_from_manifest(data_dir: Path, split: str) -> list[Pair]:
                 clean=clean, noisy=noisy,
                 snr_db=float(row.get("snr_db", "nan") or "nan"),
                 cutoff_hz=float(row.get("cutoff_hz", "nan") or "nan"),
+                scale=float(row.get("scale", 1.0) or 1.0),
             ))
     return out
 
@@ -186,7 +191,7 @@ class PairDataset(Dataset):
 
     def __init__(self, pairs: list[Pair], sr: int, seg_samples: int,
                  train: bool, seed: int = 0, with_features: bool = False,
-                 config_path: Path | None = None):
+                 config_path: Path | None = None, undo_peak_scale: bool = False):
         self.pairs = pairs
         self.sr = sr
         self.seg = seg_samples
@@ -194,6 +199,7 @@ class PairDataset(Dataset):
         self.seed = seed
         self.with_features = with_features
         self.config_path = config_path
+        self.undo_peak_scale = undo_peak_scale
         self._state = None
         self._nb_df = 0
 
@@ -257,6 +263,32 @@ class PairDataset(Dataset):
             start = max(0, (total - self.seg) // 2)
         clean = self._read(p.clean, start, self.seg)
         noisy = self._read(p.noisy, start, self.seg)
+
+        # Put the two sides back in one gain frame.
+        #
+        # The builder divides the noisy side by its own peak to keep it inside
+        # 16-bit range and leaves the clean side alone, so 95% of pairs arrive
+        # with the target a mean of 9.6 dB LOUDER than the input, sd 5.8, set by
+        # the single loudest sample in the mixture - an atmospheric crash, not
+        # anything about the speech. Trained on that, the model learns a blind
+        # make-up gain along with the denoising, and the gain correlates 0.747
+        # with the SNR, so it can be learned as "the worse it sounds the louder
+        # I make it" instead of as separating speech from noise.
+        #
+        # It cost a headline number: the first fine-tune's "speech attenuation
+        # halved, -8.1 to -3.7 dB" was mostly this shift. Measured
+        # gain-invariantly, as (speech level change - pause level change), the
+        # same model separated speech from pauses slightly WORSE than stock.
+        # The syllabic correlation, which is gain-invariant by construction,
+        # improved for real - so the finding survived, but not that statement of
+        # it.
+        #
+        # The INPUT is scaled up. The target is never touched: dividing it would
+        # drop the loss by arithmetic alone and the drop would be read as an
+        # improvement.
+        if self.undo_peak_scale and p.scale not in (0.0, 1.0):
+            noisy = noisy / p.scale
+
         snr = float(p.snr_db if not math.isnan(p.snr_db) else 0.0)
 
         if not self.with_features:
@@ -535,6 +567,30 @@ def pause_penalty(enh: "torch.Tensor", spec_clean: "torch.Tensor",
     return (per_frame * is_pause).sum() / is_pause.sum().clamp_min(1.0)
 
 
+def frozen_batchnorms(model, what: str) -> list:
+    """The BatchNorm modules inside a frozen block.
+
+    `requires_grad_(False)` stops the GRADIENTS. It does not stop a BatchNorm
+    from re-estimating its running mean and variance on every forward pass in
+    train() mode - those are buffers, not parameters. So a "frozen" encoder
+    quietly reassigns its own INFERENCE-time normalisation to whatever corpus it
+    is shown, while training itself is unaffected because train() normalises by
+    the batch.
+
+    DeepFilterNet3's encoder holds six of them. They must be put back in eval()
+    after every model.train(), which is what the caller does.
+    """
+    import torch.nn as nn
+
+    prefix = {"encoder": "enc", "erb-decoder": "erb_dec",
+              "df-decoder": "df_dec"}.get(what)
+    if prefix is None:
+        return []
+    return [module for name, module in model.named_modules()
+            if name.startswith(prefix)
+            and isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d))]
+
+
 def freeze_parts(model, what: str) -> tuple[int, int]:
     """Freeze part of the network, and say how much was frozen.
 
@@ -600,6 +656,30 @@ def main() -> int:
                          "56 s with 0 and 51 s with 4, because by then it does "
                          "not. Worth having for real epochs, not for smoke tests")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--spectral-factor", type=float, default=None,
+                    help="turn on upstream's [spectralloss] alongside the "
+                         "multi-resolution one, at this magnitude weight. It is "
+                         "0 in the released config, and the multi-resolution "
+                         "loss that carries 99.9%% of the gradient is a "
+                         "SYMMETRIC mse - it penalises removing too much exactly "
+                         "as much as removing too little. That symmetry is why "
+                         "a fine-tune sits where the stock model sits")
+    ap.add_argument("--spectral-under", type=float, default=None,
+                    help="asymmetry for [spectralloss]: the weight on frames "
+                         "where the OUTPUT IS QUIETER THAN THE TARGET, i.e. on "
+                         "over-suppression. 1 is neutral, above 1 pushes the "
+                         "model to stop eating the speech. Needs "
+                         "--spectral-factor to have any effect")
+    ap.add_argument("--undo-peak-scale", action="store_true",
+                    help="put the two sides of each pair back in one gain frame. "
+                         "The builder divides the noisy side by its own peak and "
+                         "leaves the clean side alone, so 95%% of pairs arrive "
+                         "with the target a mean of 9.6 dB louder than the "
+                         "input - a level offset set by the loudest noise "
+                         "transient, which the model has to learn as a blind "
+                         "make-up gain on top of the denoising. Off by default "
+                         "so that runs before this flag existed stay "
+                         "reproducible")
     ap.add_argument("--pause-factor", type=float, default=0.0,
                     help="weight of an extra penalty on whatever is left in the "
                          "pauses, marked from the clean side. 0 is the upstream "
@@ -661,9 +741,16 @@ def main() -> int:
             pass
 
     def say(*a, **kw):
-        """Progress talk. Silent when nobody is reading."""
+        """Progress talk. Silent when nobody is reading.
+
+        The body calls `print`, and it has to be spelled out rather than
+        rewritten in bulk: converting every `print(` in this file to `say(`
+        rewrote this line too, and the function called itself. In quiet mode it
+        returned before reaching the recursion, so a piped run just went silent
+        and nothing failed - which is why it survived several sessions.
+        """
         if not args.quiet:
-            say(*a, **kw)
+            print(*a, **kw)
 
     try:
         from df.checkpoint import load_model
@@ -681,6 +768,28 @@ def main() -> int:
         say(f"no config.ini in {args.model_base_dir} - point --model-base-dir "
               f"at a DeepFilterNet checkpoint directory", file=sys.stderr)
         return 2
+    # Loss weights are overridden by writing a DERIVED config into the run
+    # directory and loading that, rather than by poking the global config after
+    # the fact. Two reasons: the file that was actually used ends up beside the
+    # weights, so a run can be reproduced from its own directory; and the
+    # evaluation needs a config.ini there anyway.
+    if args.spectral_factor is not None or args.spectral_under is not None:
+        import configparser
+
+        derived = configparser.ConfigParser()
+        derived.read(cfg, encoding="utf-8")
+        if not derived.has_section("spectralloss"):
+            derived.add_section("spectralloss")
+        if args.spectral_factor is not None:
+            derived.set("spectralloss", "factor_magnitude", str(args.spectral_factor))
+        if args.spectral_under is not None:
+            derived.set("spectralloss", "factor_under", str(args.spectral_under))
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        cfg = args.out_dir / "config.ini"
+        with cfg.open("w", encoding="utf-8") as fh:
+            derived.write(fh)
+        print(f"loss overridden; the config actually used is {cfg}")
+
     config.load(str(cfg), allow_defaults=True)
 
     random.seed(args.seed)
@@ -730,6 +839,10 @@ def main() -> int:
     model = model.to(device)
 
     trainable, total = freeze_parts(model, args.freeze)
+    frozen_bn = frozen_batchnorms(model, args.freeze)
+    if frozen_bn:
+        say(f"{len(frozen_bn)} BatchNorm module(s) in the frozen block will be "
+            f"held in eval: freezing stops the gradients, not the running stats")
     say(f"model: {total/1e6:.2f} M parameters, {trainable/1e6:.2f} M trainable "
           f"(--freeze {args.freeze}), base epoch {base_epoch}, device {device}")
 
@@ -755,7 +868,8 @@ def main() -> int:
 
     def make_loader(pairs, train: bool, batch: int, epoch: int = 0):
         ds = PairDataset(pairs, p.sr, seg, train, seed=args.seed + epoch,
-                         with_features=True, config_path=cfg)
+                         with_features=True, config_path=cfg,
+                         undo_peak_scale=args.undo_peak_scale)
         return DataLoader(ds, batch_size=batch, shuffle=train,
                           num_workers=args.workers, drop_last=train,
                           pin_memory=(device.type == "cuda"),
@@ -861,6 +975,8 @@ def main() -> int:
     t0 = time.time()
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        for bn in frozen_bn:
+            bn.eval()          # train() just undid this; it has to follow it
         running, seen, micro_i = 0.0, 0, 0
         optimizer.zero_grad(set_to_none=True)
         epoch_start_step = step
