@@ -13,3 +13,7 @@ build/
 
 # Cargo.lock はライブラリでは除外することもあるが、アプリケーションでは含める
 # 今回は含める（再現性のため）
+
+# Fine-tuning environment and run outputs
+training/.venv/
+training/runs/

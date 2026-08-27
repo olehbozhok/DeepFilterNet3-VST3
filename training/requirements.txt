@@ -1,0 +1,19 @@
+# Fine-tuning environment. Separate from the plugin build on purpose - this
+# pulls in PyTorch and CUDA, which has no business near a Rust audio plugin.
+#
+# torch is NOT pinned here. The correct wheel depends on the GPU: an NVIDIA
+# Blackwell card (RTX 50-series, compute capability 12.0) needs a CUDA 12.8 or
+# newer build, which PyTorch has shipped since 2.7. Install it first, from the
+# index that matches the card, then this file:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r training/requirements.txt
+#
+# Verify before training, because the failure is not always loud:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())"
+# `sm_120` must be in that list for a Blackwell card.
+
+torch>=2.7
+deepfilternet>=0.5.6
+numpy>=1.24
+soundfile>=0.12

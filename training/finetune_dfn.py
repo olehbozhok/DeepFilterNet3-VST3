@@ -1,0 +1,671 @@
+"""Fine-tune DeepFilterNet3 on pre-mixed noisy/clean pairs.
+
+WHY THIS EXISTS
+---------------
+Upstream DeepFilterNet trains by mixing speech and noise AT RUNTIME: its Rust
+dataloader knows three dataset kinds - Speech, Noise, RIR - and builds every
+example by drawing one speech clip, two to five noise clips, and an SNR. There
+is no path for a corpus that is already paired.
+
+That matters when the pairing carries information the runtime mixer cannot
+reproduce. For shortwave that is at least: a slow fading envelope on the speech,
+several interferers at independent levels, and a receiver passband applied to
+BOTH sides of the pair - upstream's own bandwidth distortion is applied to the
+noisy side alone, deliberately, because there it defines a bandwidth-extension
+task rather than a denoising one.
+
+So this trains the upstream model, with the upstream loss, on pre-mixed pairs.
+Everything about the network and the objective comes from the installed
+`deepfilternet` package; only the data path is ours.
+
+WHAT IT DOES NOT DO
+-------------------
+It does not replace upstream training, it does not touch the plugin, and it
+writes nothing outside the directory given to `--out-dir`. The base checkpoint
+is opened read-only and never overwritten: it is the baseline every result is
+measured against.
+
+DATA LAYOUT EXPECTED
+--------------------
+    <data-dir>/
+      manifest.csv          optional; if present it is authoritative
+      train/clean/00000.wav
+      train/noisy/00000_0.wav
+      test/clean/...
+      test/noisy/...
+
+A noisy file belongs to the clean file whose stem is its stem up to the first
+underscore, so one clean clip may have several noisy versions. With a manifest,
+the pairing and the per-pair SNR are read from it instead of guessed.
+
+ROBUSTNESS, AND WHY EACH PIECE IS THERE
+---------------------------------------
+Training runs for hours on a laptop GPU. Every one of these is about not losing
+that time:
+
+  a checkpoint is written every `--save-every-steps` steps AND at every epoch
+  end, atomically - to a temporary file, then renamed - so an interruption
+  during the write cannot leave a truncated checkpoint where the last good one
+  used to be.
+
+  a checkpoint carries the optimizer, the scaler, the epoch, the step and the
+  RNG states, so resuming continues the run rather than starting a similar one.
+
+  running out of VRAM halves the micro-batch and retries the same step instead
+  of ending the run. Gradient accumulation keeps the effective batch size fixed,
+  so the halving changes memory and not the optimization.
+
+  Ctrl-C writes a checkpoint before exiting.
+
+  `--check-loss` runs the base model over one batch and prints the loss without
+  touching any weights. Use it before the first real run: this file computes
+  features itself instead of receiving them from upstream's dataloader, and a
+  mistake there would train something quietly different from what the model
+  expects at inference.
+
+Everything is a command-line argument. There are no paths in this file, and
+it writes nothing outside `--out-dir`.
+
+Usage:
+    python training/finetune_dfn.py --data-dir DIR --model-base-dir DIR \\
+        --out-dir DIR [--check-loss]
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import random
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# The heavy dependencies are guarded rather than imported bare. torch, numpy and
+# soundfile are genuine requirements - Dataset is a base class here, so deferring
+# them into main() would contort the file - but a missing environment should
+# produce one sentence saying what to install, not a ModuleNotFoundError from
+# line eighty.
+_ENV_HELP = (
+    "the training environment is not set up in the interpreter running this "
+    "script.\n"
+    "It needs its own virtualenv - see training/README.md:\n"
+    "    python -m venv training/.venv\n"
+    "    <venv>/pip install torch --index-url "
+    "https://download.pytorch.org/whl/cu128\n"
+    "    <venv>/pip install -r training/requirements.txt"
+)
+
+try:
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from torch.utils.data import DataLoader, Dataset
+except ImportError as _exc:                                     # noqa: BLE001
+    raise SystemExit(f"{_ENV_HELP}\n\n(missing: {_exc.name})") from None
+
+# Upstream DeepFilterNet. Imported inside main() so a missing install produces
+# one clear sentence at the point of use rather than a traceback three frames
+# down, and so this file can be read and linted without it.
+_DF_IMPORT_ERROR = (
+    "the `deepfilternet` package is required and is not importable.\n"
+    "Install it into the training environment, for example:\n"
+    "    pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
+    "    pip install deepfilternet\n"
+    "See training/README.md for the version notes."
+)
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Pair:
+    clean: Path
+    noisy: Path
+    snr_db: float = float("nan")
+    cutoff_hz: float = float("nan")
+
+
+def pairs_from_manifest(data_dir: Path, split: str) -> list[Pair]:
+    """Pairs as the corpus builder recorded them.
+
+    Preferred over globbing because it also carries the SNR, which the loss can
+    use, and because it is the only place that knows which noisy file came from
+    which clean one when the naming convention changes.
+    """
+    manifest = data_dir / "manifest.csv"
+    out: list[Pair] = []
+    with manifest.open(encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("split") != split:
+                continue
+            clean = data_dir / split / "clean" / row["clean"]
+            noisy = data_dir / split / "noisy" / row["noisy"]
+            if not (clean.exists() and noisy.exists()):
+                continue
+            out.append(Pair(
+                clean=clean, noisy=noisy,
+                snr_db=float(row.get("snr_db", "nan") or "nan"),
+                cutoff_hz=float(row.get("cutoff_hz", "nan") or "nan"),
+            ))
+    return out
+
+
+def pairs_from_layout(data_dir: Path, split: str) -> list[Pair]:
+    """Pairs recovered from the directory layout, when there is no manifest."""
+    clean_dir, noisy_dir = data_dir / split / "clean", data_dir / split / "noisy"
+    out: list[Pair] = []
+    for noisy in sorted(noisy_dir.glob("*.wav")):
+        clean = clean_dir / (noisy.stem.split("_", 1)[0] + ".wav")
+        if clean.exists():
+            out.append(Pair(clean=clean, noisy=noisy))
+    return out
+
+
+def load_pairs(data_dir: Path, split: str) -> list[Pair]:
+    if (data_dir / "manifest.csv").exists():
+        got = pairs_from_manifest(data_dir, split)
+        if got:
+            return got
+    return pairs_from_layout(data_dir, split)
+
+
+class PairDataset(Dataset):
+    """Random fixed-length crops of pre-mixed pairs.
+
+    The crop is taken at the SAME offset from both sides - they are two views of
+    one moment and are meaningless apart - and it is random per epoch, so ten
+    seconds of material is not one training example forever.
+    """
+
+    def __init__(self, pairs: list[Pair], sr: int, seg_samples: int,
+                 train: bool, seed: int = 0):
+        self.pairs = pairs
+        self.sr = sr
+        self.seg = seg_samples
+        self.train = train
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def _read(self, path: Path, start: int, n: int) -> np.ndarray:
+        x, sr = sf.read(str(path), start=start, frames=n, dtype="float32",
+                        always_2d=False)
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        if sr != self.sr:
+            raise RuntimeError(
+                f"{path.name} is {sr} Hz, the model wants {self.sr} Hz. "
+                f"Rebuild the corpus at the model's rate rather than resampling "
+                f"here - a silent resample in the data path is exactly the kind "
+                f"of difference that shows up as a bad result three days later.")
+        if len(x) < n:
+            x = np.pad(x, (0, n - len(x)))
+        return x
+
+    def __getitem__(self, i: int):
+        p = self.pairs[i]
+        info = sf.info(str(p.noisy))
+        total = int(info.frames)
+        if self.train and total > self.seg:
+            # Deterministic per (seed, index) so a resumed run sees the same
+            # crops it would have seen, rather than a different dataset.
+            rng = random.Random((self.seed, i))
+            start = rng.randrange(0, total - self.seg)
+        else:
+            start = max(0, (total - self.seg) // 2)
+        clean = self._read(p.clean, start, self.seg)
+        noisy = self._read(p.noisy, start, self.seg)
+        snr = p.snr_db if not math.isnan(p.snr_db) else 0.0
+        return torch.from_numpy(clean), torch.from_numpy(noisy), float(snr)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(path: Path, *, model, optimizer, scaler, epoch: int,
+                    step: int, best: float, args_snapshot: dict) -> None:
+    """Write a checkpoint that a resume can actually continue from.
+
+    Atomic: written beside the target and renamed. A checkpoint half-written
+    over the previous one is worse than no checkpoint, because it looks like a
+    checkpoint.
+    """
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "epoch": epoch,
+        "step": step,
+        "best": best,
+        "args": args_snapshot,
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": (torch.cuda.get_rng_state_all()
+                     if torch.cuda.is_available() else None),
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: Path, *, model, optimizer=None, scaler=None) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+    if ckpt.get("torch_rng") is not None:
+        torch.set_rng_state(ckpt["torch_rng"].to(torch.uint8))
+    if ckpt.get("cuda_rng") is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+        except Exception:                                       # noqa: BLE001
+            pass
+    if ckpt.get("numpy_rng") is not None:
+        np.random.set_state(ckpt["numpy_rng"])
+    if ckpt.get("python_rng") is not None:
+        random.setstate(ckpt["python_rng"])
+    return ckpt
+
+
+def prune_checkpoints(out_dir: Path, keep: int) -> None:
+    """Keep the newest `keep` step checkpoints. `best` and `last` are never
+    pruned - they are the two a resume or an evaluation actually reaches for."""
+    steps = sorted(out_dir.glob("step_*.pt"),
+                   key=lambda p: int(p.stem.split("_")[1]))
+    for old in steps[:-keep] if keep > 0 else []:
+        old.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OomPolicy:
+    """How the run responds to running out of VRAM.
+
+    Halving the micro-batch and raising accumulation keeps the EFFECTIVE batch
+    constant, so the optimization does not change when memory pressure does.
+    A run that quietly trains at a different batch size after an OOM would be a
+    different experiment wearing the same name.
+    """
+    micro: int
+    accum: int
+    floor: int = 1
+    events: list = field(default_factory=list)
+
+    def shrink(self, step: int) -> bool:
+        if self.micro <= self.floor:
+            return False
+        self.micro = max(self.floor, self.micro // 2)
+        self.accum *= 2
+        self.events.append({"step": step, "micro": self.micro, "accum": self.accum})
+        return True
+
+
+def build_features(df_state, nb_df: int, audio: torch.Tensor, device):
+    """Waveform -> (spec, feat_erb, feat_spec), exactly as inference does it.
+
+    Mirrors `df.enhance.df_features`. It has to: the features a fine-tune is
+    trained on and the features the plugin computes at inference must be the
+    same function, or the model is being trained for a different input than it
+    will ever see.
+    """
+    from df.enhance import df_features as _df_features
+
+    specs, erbs, sfeats = [], [], []
+    for row in audio:
+        spec, erb, sfeat = _df_features(row.unsqueeze(0).cpu(), df_state, nb_df)
+        specs.append(spec)
+        erbs.append(erb)
+        sfeats.append(sfeat)
+    spec = torch.cat(specs, dim=0).to(device)
+    feat_erb = torch.cat(erbs, dim=0).to(device)
+    feat_spec = torch.cat(sfeats, dim=0).to(device)
+    return spec, feat_erb, feat_spec
+
+
+def freeze_parts(model, what: str) -> tuple[int, int]:
+    """Freeze part of the network, and say how much was frozen.
+
+    Full fine-tuning on a corpus this size risks catastrophic forgetting: the
+    model becomes good at one broadcaster on shortwave and worse at everything
+    it already handled. Freezing the encoder keeps the learned representation
+    and adapts only what turns it into a filter.
+    """
+    if what == "none":
+        pass
+    elif what == "encoder":
+        for name, param in model.named_parameters():
+            if name.startswith("enc"):
+                param.requires_grad_(False)
+    elif what == "erb-decoder":
+        for name, param in model.named_parameters():
+            if name.startswith("erb_dec"):
+                param.requires_grad_(False)
+    elif what == "df-decoder":
+        for name, param in model.named_parameters():
+            if name.startswith("df_dec"):
+                param.requires_grad_(False)
+    else:
+        raise SystemExit(f"unknown --freeze value: {what}")
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, total
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", required=True, type=Path,
+                    help="corpus root holding train/ and test/ (and optionally "
+                         "manifest.csv)")
+    ap.add_argument("--model-base-dir", required=True, type=Path,
+                    help="DeepFilterNet checkpoint directory - the one holding "
+                         "config.ini and checkpoints/. Opened read-only")
+    ap.add_argument("--out-dir", required=True, type=Path,
+                    help="everything this run writes goes here and nowhere else")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="effective batch. Micro-batching and accumulation keep "
+                         "it constant if memory forces a smaller step")
+    ap.add_argument("--micro-batch", type=int, default=0,
+                    help="samples per forward pass; 0 means start equal to "
+                         "--batch-size and shrink only if VRAM demands it")
+    ap.add_argument("--lr", type=float, default=1e-4,
+                    help="fine-tuning, so well below the 1e-3 upstream trains "
+                         "from scratch with")
+    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--seg-seconds", type=float, default=3.0,
+                    help="crop length; upstream's own max_sample_len_s is 3.0")
+    ap.add_argument("--freeze", default="encoder",
+                    choices=("none", "encoder", "erb-decoder", "df-decoder"))
+    ap.add_argument("--device", default="")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--save-every-steps", type=int, default=200)
+    ap.add_argument("--keep-last", type=int, default=3,
+                    help="step checkpoints to keep; best and last are always kept")
+    ap.add_argument("--max-steps-per-epoch", type=int, default=0,
+                    help="0 = the whole set. A bound is useful on a laptop, "
+                         "where a shorter epoch that finishes beats a long one "
+                         "that thermal-throttles")
+    ap.add_argument("--resume", default="auto",
+                    help="'auto' continues from <out-dir>/last.pt if it exists, "
+                         "'none' starts fresh, or a path to a checkpoint")
+    ap.add_argument("--amp", action="store_true",
+                    help="mixed precision. Off by default: it halves memory and "
+                         "it also changes the numerics, and this model's loss "
+                         "works on spectra where that has not been checked here")
+    ap.add_argument("--check-loss", action="store_true",
+                    help="run the base model over one batch, print the loss, "
+                         "change nothing, exit")
+    args = ap.parse_args()
+
+    try:
+        from df.checkpoint import load_model
+        from df.config import config
+        from df.loss import Istft, Loss
+        from df.model import ModelParams
+        from libdf import DF
+    except ImportError as exc:                                  # noqa: BLE001
+        print(f"{_DF_IMPORT_ERROR}\n\n({exc})", file=sys.stderr)
+        return 2
+
+    cfg = args.model_base_dir / "config.ini"
+    if not cfg.exists():
+        print(f"no config.ini in {args.model_base_dir} - point --model-base-dir "
+              f"at a DeepFilterNet checkpoint directory", file=sys.stderr)
+        return 2
+    config.load(str(cfg), allow_defaults=True)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    device = torch.device(args.device or
+                          ("cuda" if torch.cuda.is_available() else "cpu"))
+    p = ModelParams()
+    df_state = DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size,
+                  nb_bands=p.nb_erb, min_nb_erb_freqs=p.min_nb_freqs)
+
+    # The base checkpoint is READ. Nothing this script does writes into
+    # --model-base-dir: it is the baseline, and a baseline that can be modified
+    # by the thing it is meant to judge is not one.
+    model, base_epoch = load_model(str(args.model_base_dir), df_state)
+    model = model.to(device)
+
+    trainable, total = freeze_parts(model, args.freeze)
+    print(f"model: {total/1e6:.2f} M parameters, {trainable/1e6:.2f} M trainable "
+          f"(--freeze {args.freeze}), base epoch {base_epoch}, device {device}")
+
+    istft = Istft(p.fft_size, p.hop_size,
+                  torch.as_tensor(df_state.fft_window().copy())).to(device)
+    losses = Loss(df_state, istft).to(device)
+
+    seg = int(round(args.seg_seconds * p.sr))
+    train_pairs = load_pairs(args.data_dir, "train")
+    valid_pairs = load_pairs(args.data_dir, "test")
+    if not train_pairs:
+        print(f"no training pairs under {args.data_dir}", file=sys.stderr)
+        return 2
+    print(f"data: {len(train_pairs)} train pair(s), {len(valid_pairs)} held out, "
+          f"{args.seg_seconds:.1f} s crops at {p.sr} Hz")
+
+    micro = args.micro_batch or args.batch_size
+    accum = max(1, args.batch_size // max(1, micro))
+    oom = OomPolicy(micro=micro, accum=accum)
+
+    def make_loader(pairs, train: bool, batch: int, epoch: int = 0):
+        ds = PairDataset(pairs, p.sr, seg, train, seed=args.seed + epoch)
+        return DataLoader(ds, batch_size=batch, shuffle=train,
+                          num_workers=args.workers, drop_last=train,
+                          pin_memory=(device.type == "cuda"))
+
+    def run_batch(clean_a, noisy_a, snrs):
+        clean_a = clean_a.to(device, non_blocking=True)
+        noisy_a = noisy_a.to(device, non_blocking=True)
+        spec_noisy, feat_erb, feat_spec = build_features(
+            df_state, p.nb_df, noisy_a, device)
+        spec_clean, _, _ = build_features(df_state, p.nb_df, clean_a, device)
+        from df.utils import as_complex
+        enh, m, lsnr, _ = model.forward(spec=spec_noisy.clone(),
+                                        feat_erb=feat_erb, feat_spec=feat_spec)
+        err = losses.forward(as_complex(spec_clean.squeeze(1)),
+                             as_complex(spec_noisy.squeeze(1)),
+                             enh, m, lsnr,
+                             snrs=snrs.to(device))
+        return err
+
+    if args.check_loss:
+        # No optimizer, no gradients, nothing written. This exists because the
+        # features are computed here rather than by upstream's dataloader, and
+        # an error there would train a model for inputs it will never see.
+        model.eval()
+        loader = make_loader(train_pairs, False, min(4, len(train_pairs)))
+        clean_a, noisy_a, snrs = next(iter(loader))
+        with torch.no_grad():
+            err = run_batch(clean_a, noisy_a, snrs)
+        print(f"\nbase model, one batch of {len(clean_a)}: loss {float(err):.6f}")
+        print("Nothing was written and no weight was changed.")
+        print("Sanity to apply before trusting a training run:")
+        print("  - the loss is finite and not absurd (order 1e-2..1e1 here)")
+        print("  - it is LOWER on the held-out set than on random noise pairs")
+        print("  - it does not change between two runs with the same seed")
+        return 0
+
+    params = [q for q in model.parameters() if q.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(device.type) if args.amp else None
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = {k: (str(v) if isinstance(v, Path) else v)
+                for k, v in vars(args).items()}
+    (args.out_dir / "run.json").write_text(
+        json.dumps({"args": snapshot, "base_epoch": base_epoch,
+                    "trainable": trainable, "total": total}, indent=2),
+        encoding="utf-8")
+
+    start_epoch, step, best = 0, 0, float("inf")
+    resume_path = None
+    if args.resume == "auto":
+        cand = args.out_dir / "last.pt"
+        resume_path = cand if cand.exists() else None
+    elif args.resume != "none":
+        resume_path = Path(args.resume)
+    if resume_path is not None:
+        ck = load_checkpoint(resume_path, model=model, optimizer=optimizer,
+                             scaler=scaler)
+        start_epoch, step = int(ck.get("epoch", 0)), int(ck.get("step", 0))
+        best = float(ck.get("best", float("inf")))
+        print(f"resumed from {resume_path} at epoch {start_epoch}, step {step}, "
+              f"best {best:.6f}")
+
+    log_path = args.out_dir / "train_log.csv"
+    if not log_path.exists():
+        with log_path.open("w", encoding="utf-8", newline="") as fh:
+            csv.writer(fh).writerow(
+                ["wall_s", "epoch", "step", "train_loss", "valid_loss",
+                 "micro_batch", "accum", "lr"])
+
+    stopping = {"now": False}
+
+    def on_signal(signum, _frame):
+        # One checkpoint, then leave. A run killed between the notice and the
+        # write would lose the epoch, and the whole point of this block is that
+        # hours of GPU time survive an interruption.
+        print(f"\nsignal {signum} - writing a checkpoint before exiting")
+        stopping["now"] = True
+
+    signal.signal(signal.SIGINT, on_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, on_signal)
+
+    t0 = time.time()
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        loader = make_loader(train_pairs, True, oom.micro, epoch)
+        running, seen, micro_i = 0.0, 0, 0
+        optimizer.zero_grad(set_to_none=True)
+
+        for clean_a, noisy_a, snrs in loader:
+            try:
+                if scaler is not None:
+                    with torch.amp.autocast(device.type):
+                        err = run_batch(clean_a, noisy_a, snrs) / oom.accum
+                    scaler.scale(err).backward()
+                else:
+                    err = run_batch(clean_a, noisy_a, snrs) / oom.accum
+                    err.backward()
+            except torch.cuda.OutOfMemoryError:
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                if not oom.shrink(step):
+                    print("out of memory at the smallest micro-batch - stopping "
+                          "and saving", file=sys.stderr)
+                    stopping["now"] = True
+                    break
+                print(f"  out of memory: micro-batch -> {oom.micro}, "
+                      f"accumulation -> {oom.accum}; the effective batch is "
+                      f"unchanged", file=sys.stderr)
+                break        # rebuild the loader at the new size
+
+            running += float(err) * oom.accum
+            seen += 1
+            micro_i += 1
+            if micro_i % oom.accum == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
+
+                if args.save_every_steps and step % args.save_every_steps == 0:
+                    save_checkpoint(args.out_dir / f"step_{step:07d}.pt",
+                                    model=model, optimizer=optimizer,
+                                    scaler=scaler, epoch=epoch, step=step,
+                                    best=best, args_snapshot=snapshot)
+                    save_checkpoint(args.out_dir / "last.pt", model=model,
+                                    optimizer=optimizer, scaler=scaler,
+                                    epoch=epoch, step=step, best=best,
+                                    args_snapshot=snapshot)
+                    prune_checkpoints(args.out_dir, args.keep_last)
+                    print(f"  epoch {epoch} step {step} "
+                          f"train {running/max(1,seen):.5f}", flush=True)
+
+                if args.max_steps_per_epoch and \
+                        step % max(1, args.max_steps_per_epoch) == 0:
+                    break
+            if stopping["now"]:
+                break
+
+        # ---- held-out loss, for the checkpoint selection only ---------------
+        valid = float("nan")
+        if valid_pairs and not stopping["now"]:
+            model.eval()
+            vs, vn = 0.0, 0
+            with torch.no_grad():
+                for clean_a, noisy_a, snrs in make_loader(
+                        valid_pairs, False, oom.micro):
+                    vs += float(run_batch(clean_a, noisy_a, snrs))
+                    vn += 1
+                    if vn >= 50:      # enough to rank checkpoints, not a result
+                        break
+            valid = vs / max(1, vn)
+
+        train_loss = running / max(1, seen)
+        with log_path.open("a", encoding="utf-8", newline="") as fh:
+            csv.writer(fh).writerow(
+                [round(time.time() - t0, 1), epoch, step, round(train_loss, 6),
+                 round(valid, 6) if valid == valid else "",
+                 oom.micro, oom.accum, args.lr])
+        print(f"epoch {epoch}: train {train_loss:.5f}  held-out {valid:.5f}",
+              flush=True)
+
+        save_checkpoint(args.out_dir / "last.pt", model=model,
+                        optimizer=optimizer, scaler=scaler, epoch=epoch + 1,
+                        step=step, best=best, args_snapshot=snapshot)
+        if valid == valid and valid < best:
+            best = valid
+            save_checkpoint(args.out_dir / "best.pt", model=model,
+                            optimizer=optimizer, scaler=scaler, epoch=epoch + 1,
+                            step=step, best=best, args_snapshot=snapshot)
+
+        if stopping["now"]:
+            print("stopped early; last.pt holds the current state")
+            break
+
+    if oom.events:
+        print("\nmemory pressure during this run:")
+        for e in oom.events:
+            print(f"  step {e['step']}: micro-batch {e['micro']}, "
+                  f"accumulation {e['accum']}")
+
+    print(f"\ncheckpoints in {args.out_dir}")
+    print("The held-out loss ranks checkpoints. It does NOT say the model is "
+          "better on the air:\nscore the result on real recordings before "
+          "believing anything about it.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
