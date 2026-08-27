@@ -346,11 +346,6 @@ def save_upstream_checkpoint(out_dir: Path, model, epoch: int) -> Path:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, tmp)
     os.replace(tmp, path)
-    # read_cp takes the highest epoch it finds, so old ones would win nothing -
-    # but they would still fill the disk over a long run.
-    for old_cp in sorted(cp_dir.glob("model_*.ckpt.best")):
-        if old_cp != path:
-            old_cp.unlink(missing_ok=True)
     return path
 
 
@@ -935,12 +930,12 @@ def main() -> int:
         save_checkpoint(args.out_dir / "last.pt", model=model,
                         optimizer=optimizer, scaler=scaler, epoch=epoch + 1,
                         step=step, best=best, args_snapshot=snapshot)
+        cp = save_upstream_checkpoint(args.out_dir, model, epoch + 1)
         if valid == valid and valid < best:
             best = valid
             save_checkpoint(args.out_dir / "best.pt", model=model,
                             optimizer=optimizer, scaler=scaler, epoch=epoch + 1,
                             step=step, best=best, args_snapshot=snapshot)
-            cp = save_upstream_checkpoint(args.out_dir, model, epoch + 1)
             print(f"  new best; upstream-format weights at {cp.name}")
 
         if stopping["now"]:
