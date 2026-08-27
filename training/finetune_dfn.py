@@ -450,6 +450,47 @@ def build_features(df_state, nb_df: int, audio: torch.Tensor, device):
     return spec, feat_erb, feat_spec
 
 
+class Progress:
+    """A line every `every` seconds saying where the run is and when it ends.
+
+    Not every step: at eighty steps a second that is a log nobody reads and a
+    measurable slowdown. Not only at epoch end either - a run that says nothing
+    for twenty minutes is indistinguishable from a hung one, which is a state
+    this project has already mistaken for a working capture.
+    """
+
+    def __init__(self, every: float = 10.0):
+        self.every = every
+        self.last = 0.0
+        self.t0 = time.time()
+        self.stage = ""
+
+    def show(self, stage: str, epoch: int, epochs: int, done: int, total: int,
+             loss: float = float("nan"), force: bool = False) -> None:
+        now = time.time()
+        if (stage, epoch) != self.stage:
+            # The clock restarts with the stage. Timing validation from the
+            # start of the run made its rate the average of two different
+            # things and its estimate nonsense - 18 minutes for fifty steps
+            # that took nine seconds.
+            self.stage = (stage, epoch)
+            self.t0 = now
+        if not force and (self.every <= 0 or now - self.last < self.every):
+            return
+        self.last = now
+        elapsed = now - self.t0
+        rate = done / elapsed if elapsed > 0 else 0.0
+        left = (total - done) / rate if rate > 0 and total else float("inf")
+        eta = ("--:--" if left != left or left in (float("inf"),) or left > 86400
+               else f"{int(left) // 60:02d}:{int(left) % 60:02d}")
+        bar = f"{done}/{total}" if total else str(done)
+        msg = (f"[{stage:<8}] epoch {epoch + 1}/{epochs}  {bar:>13}  "
+               f"{rate:5.2f} it/s  eta {eta}")
+        if loss == loss:
+            msg += f"  loss {loss:.4f}"
+        print(msg, flush=True)
+
+
 def freeze_parts(model, what: str) -> tuple[int, int]:
     """Freeze part of the network, and say how much was frozen.
 
@@ -515,6 +556,9 @@ def main() -> int:
                          "56 s with 0 and 51 s with 4, because by then it does "
                          "not. Worth having for real epochs, not for smoke tests")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--progress-seconds", type=float, default=10.0,
+                    help="how often to print a progress line; 0 prints "
+                         "only at the end of each stage")
     ap.add_argument("--save-every-steps", type=int, default=200)
     ap.add_argument("--keep-last", type=int, default=3,
                     help="step checkpoints to keep; best and last are always kept")
@@ -723,6 +767,16 @@ def main() -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, on_signal)
 
+    prog = Progress(args.progress_seconds)
+    # An epoch is one pass over the clips, so the number of optimizer steps
+    # is set by the EFFECTIVE batch, not by whatever the micro-batch happens
+    # to be after a resize.
+    steps_per_epoch = max(1, len(train_pairs) // max(1, args.batch_size))
+    if args.max_steps_per_epoch:
+        steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
+    print(f"one epoch is about {steps_per_epoch} optimizer step(s) over "
+          f"{len(train_pairs)} pair(s)")
+
     t0 = time.time()
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -811,6 +865,10 @@ def main() -> int:
                         print(f"  epoch {epoch} step {step} "
                               f"train {running/max(1,seen):.5f}", flush=True)
 
+                    prog.show("train", epoch, args.epochs,
+                              step - epoch_start_step, steps_per_epoch,
+                              running / max(1, seen))
+
                     if args.max_steps_per_epoch and \
                             step - epoch_start_step >= args.max_steps_per_epoch:
                         break
@@ -823,13 +881,19 @@ def main() -> int:
             model.eval()
             vs, vn = 0.0, 0
             with torch.no_grad():
+                n_valid = min(50, max(1, len(valid_pairs) // max(1, oom.micro)))
+                prog.show("validate", epoch, args.epochs, 0, n_valid, force=True)
                 for item in make_loader(valid_pairs, False, oom.micro):
                     vs += float(run_batch(item))
                     vn += 1
+                    prog.show("validate", epoch, args.epochs, vn, n_valid,
+                              vs / max(1, vn))
                     if vn >= 50:      # enough to rank checkpoints, not a result
                         break
             valid = vs / max(1, vn)
 
+        prog.show("train", epoch, args.epochs, step - epoch_start_step,
+                  steps_per_epoch, running / max(1, seen), force=True)
         train_loss = running / max(1, seen)
         with log_path.open("a", encoding="utf-8", newline="") as fh:
             csv.writer(fh).writerow(
