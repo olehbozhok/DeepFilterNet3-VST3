@@ -217,7 +217,7 @@ class PairDataset(Dataset):
         if self.train and total > self.seg:
             # Deterministic per (seed, index) so a resumed run sees the same
             # crops it would have seen, rather than a different dataset.
-            rng = random.Random((self.seed, i))
+            rng = random.Random(self.seed * 1_000_003 + i)
             start = rng.randrange(0, total - self.seg)
         else:
             start = max(0, (total - self.seg) // 2)
@@ -278,6 +278,30 @@ def load_checkpoint(path: Path, *, model, optimizer=None, scaler=None) -> dict:
     if ckpt.get("python_rng") is not None:
         random.setstate(ckpt["python_rng"])
     return ckpt
+
+
+def save_upstream_checkpoint(out_dir: Path, model, epoch: int) -> Path:
+    """Write the weights the way upstream reads them.
+
+    Two things need this and neither can read our format: the real-pair
+    evaluation, which loads a candidate with `df.checkpoint.load_model`, and
+    `df/scripts/export.py`, which is how a finished model reaches the plugin.
+    `read_cp` wants a bare state_dict under `checkpoints/model_<epoch>.ckpt`, so
+    that is what goes there - beside, not instead of, the resumable checkpoint
+    that carries the optimizer and the RNG.
+    """
+    cp_dir = out_dir / "checkpoints"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    path = cp_dir / f"model_{epoch}.ckpt.best"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, tmp)
+    os.replace(tmp, path)
+    # read_cp takes the highest epoch it finds, so old ones would win nothing -
+    # but they would still fill the disk over a long run.
+    for old_cp in sorted(cp_dir.glob("model_*.ckpt.best")):
+        if old_cp != path:
+            old_cp.unlink(missing_ok=True)
+    return path
 
 
 def prune_checkpoints(out_dir: Path, keep: int) -> None:
@@ -609,7 +633,7 @@ def main() -> int:
                       f"unchanged", file=sys.stderr)
                 break        # rebuild the loader at the new size
 
-            running += float(err) * oom.accum
+            running += float(err.detach()) * oom.accum
             seen += 1
             micro_i += 1
             if micro_i % oom.accum == 0:
@@ -680,6 +704,8 @@ def main() -> int:
             save_checkpoint(args.out_dir / "best.pt", model=model,
                             optimizer=optimizer, scaler=scaler, epoch=epoch + 1,
                             step=step, best=best, args_snapshot=snapshot)
+            cp = save_upstream_checkpoint(args.out_dir, model, epoch + 1)
+            print(f"  new best; upstream-format weights at {cp.name}")
 
         if stopping["now"]:
             print("stopped early; last.pt holds the current state")
