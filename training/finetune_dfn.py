@@ -420,6 +420,7 @@ def main() -> int:
         from df.config import config
         from df.loss import Istft, Loss
         from df.model import ModelParams
+        from df.utils import detach_hidden
         from libdf import DF
     except ImportError as exc:                                  # noqa: BLE001
         print(f"{_DF_IMPORT_ERROR}\n\n({exc})", file=sys.stderr)
@@ -621,6 +622,12 @@ def main() -> int:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                # Cut the graph between steps, as upstream's own loop does. The
+                # network is recurrent; without this any hidden state kept on the
+                # module stays attached to the previous step's graph, which grows
+                # the backward pass without bound and makes the gradients wrong
+                # in a way that shows up as memory, not as an error.
+                detach_hidden(model)
                 step += 1
 
                 if args.save_every_steps and step % args.save_every_steps == 0:
