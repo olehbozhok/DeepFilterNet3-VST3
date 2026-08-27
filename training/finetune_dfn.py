@@ -445,7 +445,29 @@ def main() -> int:
     # The base checkpoint is READ. Nothing this script does writes into
     # --model-base-dir: it is the baseline, and a baseline that can be modified
     # by the thing it is meant to judge is not one.
-    model, base_epoch = load_model(str(args.model_base_dir), df_state)
+    #
+    # `read_cp` globs `model*.ckpt` in the directory it is GIVEN, and a released
+    # DeepFilterNet model puts them in a `checkpoints/` subdirectory next to
+    # config.ini. Handed the parent, it finds nothing, returns None, and
+    # `load_model` turns that into epoch 0 - a randomly initialised network, with
+    # a log line that looks like success.
+    #
+    # That is not hypothetical. It happened here on 2026-08-27 and was caught
+    # only by comparing the Python path against the reference binary: on a clip
+    # at +9.9 dB SNR the untrained network returned -48.5 dBFS where the binary
+    # returned -18.7. Fine-tuning would have run for hours, from noise, and the
+    # loss would have gone down the whole time.
+    cp_dir = args.model_base_dir / "checkpoints"
+    if not cp_dir.is_dir():
+        cp_dir = args.model_base_dir
+    model, base_epoch = load_model(str(cp_dir), df_state, epoch="best")
+    if base_epoch == 0:
+        print(f"no checkpoint was loaded from {cp_dir}.", file=sys.stderr)
+        print("`read_cp` looks for model*.ckpt or model*.ckpt.best there. "
+              "Without one the network is randomly initialised, and "
+              "training would start from noise while reporting nothing "
+              "wrong.", file=sys.stderr)
+        return 2
     model = model.to(device)
 
     trainable, total = freeze_parts(model, args.freeze)
@@ -481,12 +503,14 @@ def main() -> int:
         spec_noisy, feat_erb, feat_spec = build_features(
             df_state, p.nb_df, noisy_a, device)
         spec_clean, _, _ = build_features(df_state, p.nb_df, clean_a, device)
-        from df.utils import as_complex
         enh, m, lsnr, _ = model.forward(spec=spec_noisy.clone(),
                                         feat_erb=feat_erb, feat_spec=feat_spec)
-        err = losses.forward(as_complex(spec_clean.squeeze(1)),
-                             as_complex(spec_noisy.squeeze(1)),
-                             enh, m, lsnr,
+        # The loss wants the REAL-VALUED spectrogram form, [B, C, T, F, 2], not
+        # complex: `df.modules.local_snr` asserts `clean.dim() == 5`. That is
+        # what `df_features` already returns, so the tensors go in untouched.
+        # Converting them to complex first raises an assertion four frames down
+        # with no hint of which argument was wrong.
+        err = losses.forward(spec_clean, spec_noisy, enh, m, lsnr,
                              snrs=snrs.to(device))
         return err
 

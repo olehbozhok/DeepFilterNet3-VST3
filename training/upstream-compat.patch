@@ -1,0 +1,68 @@
+Compatibility shim for building the upstream DeepFilterNet Python package
+against a modern torchaudio.
+
+Apply to a checkout of https://github.com/Rikorose/DeepFilterNet at tag v0.5.6
+(commit 978576aa8400552a4ce9730838c635aa30db5e61):
+
+    git -C <upstream-checkout> apply <this file>
+
+WHY IT IS NEEDED
+----------------
+v0.5.6 is from August 2023 and imports `torchaudio.backend.common.AudioMetaData`
+at module scope in `df/io.py`. torchaudio removed the `backend` module, so the
+import fails and takes the whole `df` package down with it - including
+`df.enhance.df_features`, which has nothing to do with file IO.
+
+An NVIDIA Blackwell card needs a CUDA 12.8 build of torch, which means torch 2.7
+or newer, which means a torchaudio far past the one this code was written
+against. Pinning the old torchaudio instead would mean a torch without sm_120
+kernels. So the shim is the cheaper end of a real constraint, not a shortcut.
+
+WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT
+-----------------------------------------------
+`AudioMetaData` is used in `df/io.py` only as a TYPE ANNOTATION and as the
+declared return of `ta.info()`. The shim restores the name.
+
+It does NOT restore `ta.info()`, which modern torchaudio also removed. That
+function is called inside `load_audio()`, and `load_audio()` is not on the path
+this project uses - audio is read with soundfile. Making it import cleanly and
+then fail at call time with a bare AttributeError would be worse than failing
+with a sentence, so the shim raises one instead.
+
+--- a/DeepFilterNet/df/io.py
++++ b/DeepFilterNet/df/io.py
+@@
+-from torchaudio.backend.common import AudioMetaData
++try:  # torchaudio < 2.9
++    from torchaudio.backend.common import AudioMetaData
++except ImportError:  # pragma: no cover - depends on the installed torchaudio
++    try:
++        from torchaudio import AudioMetaData  # type: ignore[attr-defined]
++    except ImportError:
++        from dataclasses import dataclass as _dataclass
++
++        @_dataclass
++        class AudioMetaData:  # type: ignore[no-redef]
++            """Stand-in for the class modern torchaudio no longer ships.
++
++            Used here only as a type annotation and as the declared return of
++            `ta.info()`, which this torchaudio also removed. Anything that
++            actually needs the metadata is reading files a different way.
++            """
++
++            sample_rate: int = 0
++            num_frames: int = 0
++            num_channels: int = 0
++            bits_per_sample: int = 0
++            encoding: str = ""
++
++
++if not hasattr(ta, "info"):  # pragma: no cover
++    def _info_removed(*_args, **_kwargs):
++        raise RuntimeError(
++            "torchaudio.info() was removed in this torchaudio version, so "
++            "df.io.load_audio() cannot report the source sample rate. Read the "
++            "audio with soundfile instead - that is the path this project uses."
++        )
++
++    ta.info = _info_removed  # type: ignore[attr-defined]
