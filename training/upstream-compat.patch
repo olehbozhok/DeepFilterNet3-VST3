@@ -1,33 +1,47 @@
-Compatibility shim for building the upstream DeepFilterNet Python package
-against a modern torchaudio.
+Compatibility shims for running the upstream DeepFilterNet Python package
+against a modern torch/torchaudio.
 
 Apply to a checkout of https://github.com/Rikorose/DeepFilterNet at tag v0.5.6
-(commit 978576aa8400552a4ce9730838c635aa30db5e61):
+(commit 978576aa8400552a4ce9730838c635aa30db5e61) — the same commit this
+plugin's `df` dependency is pinned to in Cargo.lock, so the Python side and the
+Rust side are the same code.
 
     git -C <upstream-checkout> apply <this file>
 
-WHY IT IS NEEDED
-----------------
-v0.5.6 is from August 2023 and imports `torchaudio.backend.common.AudioMetaData`
-at module scope in `df/io.py`. torchaudio removed the `backend` module, so the
-import fails and takes the whole `df` package down with it - including
-`df.enhance.df_features`, which has nothing to do with file IO.
+WHY ANY OF THIS IS NEEDED
+-------------------------
+v0.5.6 is from August 2023. An NVIDIA Blackwell card needs a CUDA 12.8 build of
+torch, which means torch 2.7 or newer, which drags torchaudio and the ONNX
+exporter far past what that code was written against. Pinning the old versions
+instead would mean a torch with no sm_120 kernels. These are the cheap end of a
+real constraint, not shortcuts.
 
-An NVIDIA Blackwell card needs a CUDA 12.8 build of torch, which means torch 2.7
-or newer, which means a torchaudio far past the one this code was written
-against. Pinning the old torchaudio instead would mean a torch without sm_120
-kernels. So the shim is the cheaper end of a real constraint, not a shortcut.
+Three shims, all in code that is incidental to what this project uses:
 
-WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT
------------------------------------------------
-`AudioMetaData` is used in `df/io.py` only as a TYPE ANNOTATION and as the
-declared return of `ta.info()`. The shim restores the name.
+  1. `torchaudio.backend.common.AudioMetaData` — removed. Used in df/io.py only
+     as a type annotation and as the declared return of `ta.info`.
 
-It does NOT restore `ta.info()`, which modern torchaudio also removed. That
-function is called inside `load_audio()`, and `load_audio()` is not on the path
-this project uses - audio is read with soundfile. Making it import cleanly and
-then fail at call time with a bare AttributeError would be worse than failing
-with a sentence, so the shim raises one instead.
+  2. `torchaudio.info` and `torchaudio.load` — `info` is gone, and `load` now
+     delegates to TorchCodec, another dependency chain. Both are reimplemented
+     over soundfile, which is already a dependency and reads exactly what they
+     reported. They matter because df/scripts/export.py loads a test sample
+     through them before exporting.
+
+  3. `torch.onnx.export` — torch 2.6 made the dynamo exporter the default, and
+     it cannot convert this script's `dynamic_axes`, wanting `dynamic_shapes`
+     instead. The TorchScript exporter is still present and still produces the
+     graph the Rust side loads through tract, so it is asked for explicitly
+     rather than rewriting the axis spec for a new front end. The request is
+     conditional on the parameter existing, so the patch stays valid on older
+     torch.
+
+VERIFIED, NOT ASSUMED
+---------------------
+With these applied, the Python path was checked against the reference binary on
+real recordings: correlation 0.9999 at +9.9 dB SNR and 1.0000 at -9 dB, levels
+within 0.07 dB, zero lag. And a model exported through the patched export.py
+reproduces its own PyTorch original at correlation 0.989-0.993 with zero lag,
+the residual being tract's operation order rather than a difference in weights.
 
 --- a/DeepFilterNet/df/io.py
 +++ b/DeepFilterNet/df/io.py
@@ -43,12 +57,7 @@ with a sentence, so the shim raises one instead.
 +
 +        @_dataclass
 +        class AudioMetaData:  # type: ignore[no-redef]
-+            """Stand-in for the class modern torchaudio no longer ships.
-+
-+            Used here only as a type annotation and as the declared return of
-+            `ta.info()`, which this torchaudio also removed. Anything that
-+            actually needs the metadata is reading files a different way.
-+            """
++            """Stand-in for the class modern torchaudio no longer ships."""
 +
 +            sample_rate: int = 0
 +            num_frames: int = 0
@@ -58,11 +67,49 @@ with a sentence, so the shim raises one instead.
 +
 +
 +if not hasattr(ta, "info"):  # pragma: no cover
-+    def _info_removed(*_args, **_kwargs):
-+        raise RuntimeError(
-+            "torchaudio.info() was removed in this torchaudio version, so "
-+            "df.io.load_audio() cannot report the source sample rate. Read the "
-+            "audio with soundfile instead - that is the path this project uses."
++    # `info` only ever reported the header, which soundfile reads perfectly
++    # well, so this is a real implementation rather than a refusal: load_audio
++    # is on the export path and needs it to work, not to explain itself.
++    import soundfile as _sf
++
++    _ENCODINGS = {"PCM_S": "PCM_S", "PCM_U": "PCM_U", "PCM_F": "PCM_F",
++                  "FLOAT": "PCM_F", "DOUBLE": "PCM_F", "VORBIS": "VORBIS",
++                  "MPEG_LAYER_III": "MP3"}
++
++    def _info_via_soundfile(file, *_args, **_kwargs):
++        i = _sf.info(str(file))
++        bits = {"PCM_16": 16, "PCM_24": 24, "PCM_32": 32,
++                "PCM_S8": 8, "FLOAT": 32, "DOUBLE": 64}.get(i.subtype, 0)
++        return AudioMetaData(
++            sample_rate=int(i.samplerate),
++            num_frames=int(i.frames),
++            num_channels=int(i.channels),
++            bits_per_sample=bits,
++            encoding=_ENCODINGS.get(i.subtype_info or i.subtype, i.subtype or ""),
 +        )
 +
-+    ta.info = _info_removed  # type: ignore[attr-defined]
++    ta.info = _info_via_soundfile  # type: ignore[attr-defined]
++
++    # `ta.load` in this torchaudio delegates to TorchCodec, another dependency
++    # chain for something soundfile already does. Returns [C, T] and the rate,
++    # which is the contract df.io relies on.
++    def _load_via_soundfile(file, *_args, **_kwargs):
++        x, sr = _sf.read(str(file), dtype="float32", always_2d=True)
++        return torch.from_numpy(x.T.copy()), int(sr)
++
++    ta.load = _load_via_soundfile  # type: ignore[attr-defined]
+
+--- a/DeepFilterNet/df/scripts/export.py
++++ b/DeepFilterNet/df/scripts/export.py
+@@
+         opset_version=opset_version,
+         keep_initializers_as_inputs=False,
++        # torch 2.6 made the dynamo exporter the default, and it cannot convert
++        # this script's `dynamic_axes` - it wants `dynamic_shapes` instead. The
++        # TorchScript exporter is still there and still produces the graph the
++        # Rust side loads through tract, so ask for it explicitly rather than
++        # rewriting the axis spec for a new front end. Conditional, so the patch
++        # stays valid on a torch that has no such parameter.
++        **({"dynamo": False} if "dynamo" in
++           __import__("inspect").signature(torch.onnx.export).parameters else {}),
+     )

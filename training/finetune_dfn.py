@@ -489,6 +489,52 @@ class Progress:
         print(msg, flush=True)
 
 
+def pause_penalty(enh: "torch.Tensor", spec_clean: "torch.Tensor",
+                  percentile: float = 0.2, gamma: float = 0.3) -> "torch.Tensor":
+    """How far the output is from the CLEAN SIGNAL in the frames without speech.
+
+    The objective this project wrote down asks for two things at once: keep the
+    speech, and leave no more noise in the pauses than the stock model does.
+    Across four models those moved in opposite directions without exception,
+    because to the network they are ONE control - a single notion of how hard to
+    suppress - and the loss offers it a single compromise.
+
+    They are not one thing to a listener, though: noise between words is
+    tolerable, a comb through a vowel is not. So this term adds a second control
+    that cannot cost any speech, by acting only where the clean signal is quiet.
+
+    WHAT IT IS NOT: a push toward silence. That was the first version, and
+    measurement killed it. On real windows at -18..-5 dB the reference's OWN
+    pauses sit at -36.1 dBFS - the broadcaster has a noise floor like everyone
+    else - while stock DFN3 drives them to -45.8, which is 7.7 dB BELOW the
+    source. Driving the residual to zero would train the model to beat the truth
+    rather than match it, which is the same over-suppression that eats the
+    speech, arrived at from a different direction. The fine-tune this replaced
+    it with sits 1.0 dB from the source.
+
+    So the term is a DISTANCE to the clean signal, re-weighted onto pause
+    frames. The pauses are marked from the clean side, the same way
+    `pairs.snr_by_pauses` marks them for the measurement, so the thing being
+    trained and the thing being measured agree about which frames are pauses.
+
+    `gamma` matches the compression the upstream spectral loss uses: without it
+    the term is dominated by the loudest residual and ignores the quiet hiss
+    that is most of what a listener hears between words.
+    """
+    import torch
+
+    clean_mag = torch.linalg.vector_norm(spec_clean, dim=-1)      # [B, C, T, F]
+    frame = clean_mag.pow(2).mean(dim=-1)                          # [B, C, T]
+    thresh = torch.quantile(frame.flatten(1), percentile, dim=1)
+    is_pause = (frame <= thresh.view(-1, 1, 1)).to(frame.dtype)
+
+    enh_mag = torch.linalg.vector_norm(enh, dim=-1)
+    a = enh_mag.clamp_min(1e-12).pow(gamma)
+    b = clean_mag.clamp_min(1e-12).pow(gamma)
+    per_frame = (a - b).pow(2).mean(dim=-1)                        # [B, C, T]
+    return (per_frame * is_pause).sum() / is_pause.sum().clamp_min(1.0)
+
+
 def freeze_parts(model, what: str) -> tuple[int, int]:
     """Freeze part of the network, and say how much was frozen.
 
@@ -554,6 +600,15 @@ def main() -> int:
                          "56 s with 0 and 51 s with 4, because by then it does "
                          "not. Worth having for real epochs, not for smoke tests")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--pause-factor", type=float, default=0.0,
+                    help="weight of an extra penalty on whatever is left in the "
+                         "pauses, marked from the clean side. 0 is the upstream "
+                         "loss alone. The objective asks to keep the speech AND "
+                         "leave no more noise than stock, and across four models "
+                         "those moved in opposite directions every time - to the "
+                         "network they are one control. This gives it a second "
+                         "one that cannot cost any speech, because it applies "
+                         "only where the clean signal is quiet")
     ap.add_argument("--quiet", action="store_true", default=None,
                     help="print only what a reader needs afterwards: the final "
                          "loss, the checkpoint, and anything that went wrong. "
@@ -723,6 +778,8 @@ def main() -> int:
         # with no hint of which argument was wrong.
         err = losses.forward(spec_clean, spec_noisy, enh, m, lsnr,
                              snrs=snrs.to(device))
+        if args.pause_factor > 0:
+            err = err + args.pause_factor * pause_penalty(enh, spec_clean)
         return err
 
     if args.check_loss:

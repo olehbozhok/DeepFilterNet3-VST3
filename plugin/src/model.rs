@@ -5,6 +5,7 @@
 
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
+use std::path::{Path, PathBuf};
 
 /// Fixed timing expected by the embedded official DeepFilterNet model.
 pub(crate) const MODEL_SAMPLE_RATE: usize = 48_000;
@@ -83,9 +84,83 @@ pub(super) struct DfEngine {
     last_applied_attenuation: Option<f32>,
 }
 
+/// Where a model comes from.
+///
+/// The embedded model is the default and the only one the shipped plugin needs.
+/// The other two exist because a fine-tuned model is a file that changes: baking
+/// it in means rebuilding the plugin for every training run, and comparing two
+/// models by ear then means two builds. A path or a buffer costs nothing at
+/// runtime and keeps that loop to seconds.
+pub(crate) enum ModelSource<'a> {
+    /// The model compiled in by the `model-ll` or `model-standard` feature.
+    Embedded,
+    /// A `*_onnx.tar.gz` on disk, as produced by DeepFilterNet's `export.py`.
+    File(PathBuf),
+    /// The same archive already in memory.
+    Bytes(&'a [u8]),
+}
+
+/// Name of the environment variable that points at an external model.
+///
+/// An environment variable rather than a control in the editor: the editor is
+/// specified to hold exactly two parameter sliders and nothing else, and a
+/// model chooser is not a mix control. This is a developer's door, not a user's.
+pub(crate) const MODEL_PATH_ENV: &str = "DEEPFILTER_MODEL";
+
+fn params_from(source: ModelSource<'_>) -> Result<DfParams, ModelError> {
+    match source {
+        ModelSource::Embedded => Ok(DfParams::default()),
+        ModelSource::File(path) => DfParams::new(path.clone()).map_err(|error| {
+            ModelError::new(format!(
+                "could not read the model at {}: {error}",
+                path.display()
+            ))
+        }),
+        ModelSource::Bytes(bytes) => {
+            // `DfParams::from_bytes` wants `&'static [u8]`, because upstream
+            // wrote it for `include_bytes!`. The archive has to outlive the
+            // model that borrows from it, and the model lives as long as the
+            // plugin instance, so the buffer is leaked deliberately - once, at
+            // load, for about eight megabytes.
+            //
+            // That is a fair price for loading once. It would NOT be fair for a
+            // plugin that swapped models repeatedly, so if that day comes this
+            // is the line to revisit rather than the place to add a cache.
+            let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+            DfParams::from_bytes(leaked)
+                .map_err(|error| ModelError::new(format!("could not read the model bytes: {error}")))
+        }
+    }
+}
+
 impl DfEngine {
+    /// The embedded model, or whatever `DEEPFILTER_MODEL` points at.
+    ///
+    /// A missing or unreadable external model is an ERROR, not a silent
+    /// fallback to the embedded one: someone who set the variable wants that
+    /// model, and quietly running a different one would make every measurement
+    /// afterwards a lie about which model produced it.
     pub(super) fn new() -> Result<Self, ModelError> {
-        let params = DfParams::default();
+        match std::env::var_os(MODEL_PATH_ENV) {
+            Some(path) if !path.is_empty() => {
+                Self::from_source(ModelSource::File(PathBuf::from(path)))
+            }
+            _ => Self::from_source(ModelSource::Embedded),
+        }
+    }
+
+    /// Build from an archive already in memory.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, ModelError> {
+        Self::from_source(ModelSource::Bytes(bytes))
+    }
+
+    /// Build from a `*_onnx.tar.gz` on disk.
+    pub(crate) fn from_path(path: &Path) -> Result<Self, ModelError> {
+        Self::from_source(ModelSource::File(path.to_path_buf()))
+    }
+
+    pub(crate) fn from_source(source: ModelSource<'_>) -> Result<Self, ModelError> {
+        let params = params_from(source)?;
         let runtime = RuntimeParams::default_with_ch(1);
         let pristine = DfTract::new(params, &runtime)
             .map_err(|error| ModelError::new(format!("could not construct DeepFilterNet: {error}")))?;
@@ -177,6 +252,54 @@ mod tests {
                     + 0.05 * (phase * 1_731.0 * std::f32::consts::TAU).sin()
             })
             .collect()
+    }
+
+    /// An external model has to load, report its own timing, and actually run.
+    ///
+    /// The point of the external path is a fine-tuned model, and a fine-tuned
+    /// DeepFilterNet3 is architecturally the standard model - lookahead 2, not
+    /// the low-latency 0 - so the timing it reports is NOT the embedded model's.
+    /// A test that only checked "it constructs" would pass while the plugin
+    /// reported the wrong latency to the host and aligned the dry path wrongly.
+    ///
+    /// Skipped, not failed, when no model file is given: it needs a real
+    /// exported archive, and CI has none. Point `DEEPFILTER_TEST_MODEL` at a
+    /// `*_onnx.tar.gz` to run it.
+    #[test]
+    fn an_external_model_loads_from_a_path_and_from_bytes() {
+        let Some(path) = std::env::var_os("DEEPFILTER_TEST_MODEL") else {
+            eprintln!("skipped: set DEEPFILTER_TEST_MODEL to an exported *_onnx.tar.gz");
+            return;
+        };
+        let path = PathBuf::from(path);
+        let _serial = crate::test_support::serialize_real_model();
+
+        let mut from_path = DfEngine::from_path(&path).expect("model must load from a path");
+        let info = from_path.info();
+        assert_eq!(info.sample_rate, MODEL_SAMPLE_RATE);
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.hop_size, MODEL_HOP_SIZE);
+
+        let bytes = std::fs::read(&path).expect("model file must be readable");
+        let mut from_bytes = DfEngine::from_bytes(&bytes).expect("model must load from bytes");
+        assert_eq!(
+            from_bytes.info(),
+            info,
+            "the same archive must describe the same model whichever way it was read"
+        );
+
+        // And it must process, not merely construct. Silence in, silence out is
+        // not evidence; a tone has to come through.
+        let mut a_nonzero = false;
+        let mut b_nonzero = false;
+        for hop in 0..8 {
+            let frame = model_fixture(hop * MODEL_HOP_SIZE);
+            let a = from_path.process_hop(&frame, 20.0).expect("path model must process");
+            a_nonzero |= a.iter().any(|sample| sample.abs() > 1e-6);
+            let b = from_bytes.process_hop(&frame, 20.0).expect("bytes model must process");
+            b_nonzero |= b.iter().any(|sample| sample.abs() > 1e-6);
+        }
+        assert!(a_nonzero && b_nonzero, "the external model produced only silence");
     }
 
     #[test]

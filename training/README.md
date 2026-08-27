@@ -119,6 +119,35 @@ Every one of these is about not losing hours of GPU time:
 On a laptop, `--max-steps-per-epoch` is worth using: a shorter epoch that
 finishes beats a long one that thermal-throttles halfway.
 
+## Getting a trained model into the plugin
+
+`df/scripts/export.py` from the upstream checkout turns a checkpoint into the
+three ONNX graphs and the `config.ini` the plugin's Rust side loads, tarred as
+`<name>_onnx.tar.gz`:
+
+```bash
+python df/scripts/export.py --model-base-dir <run-dir> <export-dir>
+```
+
+Check it before trusting it. `deep-filter.exe -m <archive>` runs the exported
+model through the same tract path the plugin uses, so the export can be compared
+against its own PyTorch original without touching the plugin at all. Ours agreed
+at correlation 0.989-0.993 with zero lag and levels within 0.3 dB; the residual
+is tract's operation order, not a difference in weights.
+
+The plugin will then load it from a path or from a buffer:
+
+```bash
+DEEPFILTER_MODEL=<path-to>_onnx.tar.gz   # then start the host
+```
+
+An environment variable rather than a control in the editor, because the editor
+is specified to carry exactly two parameter sliders and a model chooser is not a
+mix control. A missing or unreadable file is an error, not a silent fallback to
+the embedded model: someone who set the variable wants that model, and quietly
+running a different one would make every measurement afterwards a lie about
+which model produced it.
+
 ## What "better" means
 
 The held-out loss ranks checkpoints. It does **not** say the model is better on
