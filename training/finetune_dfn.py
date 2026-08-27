@@ -185,12 +185,17 @@ class PairDataset(Dataset):
     """
 
     def __init__(self, pairs: list[Pair], sr: int, seg_samples: int,
-                 train: bool, seed: int = 0):
+                 train: bool, seed: int = 0, with_features: bool = False,
+                 config_path: Path | None = None):
         self.pairs = pairs
         self.sr = sr
         self.seg = seg_samples
         self.train = train
         self.seed = seed
+        self.with_features = with_features
+        self.config_path = config_path
+        self._state = None
+        self._nb_df = 0
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -210,6 +215,35 @@ class PairDataset(Dataset):
             x = np.pad(x, (0, n - len(x)))
         return x
 
+    def _df_state(self):
+        """One DF state per worker process, built on first use.
+
+        The features used to be computed in the training loop: a Python loop
+        over the batch, twice per step, on one core, while the GPU waited. They
+        depend only on the audio, so they belong in the loader, where N workers
+        compute them in parallel and overlap with the step before.
+
+        The state is Rust-backed and cannot be pickled into a worker, so each
+        worker builds its own. `config` is process-global upstream and refuses a
+        second load, which is exactly right here: fresh in a worker, already
+        loaded when num_workers is 0.
+        """
+        if self._state is not None:
+            return self._state
+        from df.config import config
+        from df.model import ModelParams
+        from libdf import DF
+
+        try:
+            config.load(str(self.config_path), allow_defaults=True)
+        except ValueError:
+            pass                     # already loaded in this process
+        p = ModelParams()
+        self._nb_df = p.nb_df
+        self._state = DF(sr=p.sr, fft_size=p.fft_size, hop_size=p.hop_size,
+                         nb_bands=p.nb_erb, min_nb_erb_freqs=p.min_nb_freqs)
+        return self._state
+
     def __getitem__(self, i: int):
         p = self.pairs[i]
         info = sf.info(str(p.noisy))
@@ -223,8 +257,24 @@ class PairDataset(Dataset):
             start = max(0, (total - self.seg) // 2)
         clean = self._read(p.clean, start, self.seg)
         noisy = self._read(p.noisy, start, self.seg)
-        snr = p.snr_db if not math.isnan(p.snr_db) else 0.0
-        return torch.from_numpy(clean), torch.from_numpy(noisy), float(snr)
+        snr = float(p.snr_db if not math.isnan(p.snr_db) else 0.0)
+
+        if not self.with_features:
+            return torch.from_numpy(clean), torch.from_numpy(noisy), snr
+
+        from df.enhance import df_features
+        from df.utils import as_real
+
+        state = self._df_state()
+        spec_n, erb, feat = df_features(torch.from_numpy(noisy).unsqueeze(0),
+                                        state, self._nb_df)
+        # The clean side needs its spectrogram and nothing else - the loss reads
+        # it, the model never sees it - so only the analysis is run, not the
+        # whole feature set.
+        spec_c = as_real(torch.as_tensor(
+            state.analysis(clean[None, :])).unsqueeze(1))
+        return (spec_c.squeeze(0), spec_n.squeeze(0), erb.squeeze(0),
+                feat.squeeze(0), snr)
 
 
 # ---------------------------------------------------------------------------
@@ -331,12 +381,50 @@ class OomPolicy:
     floor: int = 1
     events: list = field(default_factory=list)
 
+    ceiling: int = 0          # never grow past the configured effective batch
+    quiet: int = 0            # consecutive steps with room to spare
+
     def shrink(self, step: int) -> bool:
         if self.micro <= self.floor:
             return False
         self.micro = max(self.floor, self.micro // 2)
         self.accum *= 2
-        self.events.append({"step": step, "micro": self.micro, "accum": self.accum})
+        self.quiet = 0
+        self.events.append({"step": step, "micro": self.micro,
+                            "accum": self.accum, "why": "out of memory"})
+        return True
+
+    def maybe_grow(self, step: int, peak_bytes: float, cap_bytes: float,
+                   target: float = 0.75, patience: int = 30) -> bool:
+        """Take the micro-batch back up while there is room to spare.
+
+        It grows only up to the EFFECTIVE batch, and that bound is the whole
+        design. The effective batch is a hyperparameter of the experiment: a run
+        that quietly enlarged it because the card had room would be a different
+        experiment wearing the same name, and its result would not be comparable
+        to the one before it. What this recovers is accumulation - the micro-batch
+        halved by an earlier out-of-memory event, or a conservative starting
+        value - which changes speed and nothing else.
+
+        `target` is deliberately well under the cap. Peak usage varies between
+        steps with the content, so growing at 95% would mean growing straight
+        into the next shrink, and each of those costs a discarded batch.
+        """
+        if self.ceiling and self.micro >= self.ceiling:
+            return False
+        if cap_bytes <= 0 or peak_bytes / cap_bytes > target:
+            self.quiet = 0
+            return False
+        self.quiet += 1
+        if self.quiet < patience:
+            return False
+        if self.accum <= 1:
+            return False
+        self.micro = min(self.ceiling or self.micro * 2, self.micro * 2)
+        self.accum = max(1, self.accum // 2)
+        self.quiet = 0
+        self.events.append({"step": step, "micro": self.micro,
+                            "accum": self.accum, "why": "room to spare"})
         return True
 
 
@@ -418,7 +506,14 @@ def main() -> int:
     ap.add_argument("--freeze", default="encoder",
                     choices=("none", "encoder", "erb-decoder", "df-decoder"))
     ap.add_argument("--device", default="")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="loader processes. NOT the core count: each one is a "
+                         "separate process on Windows that re-imports torch and "
+                         "df, and the loader is not the bottleneck. Measured at "
+                         "batch 8 - 100 steps take 23 s with 0 workers and 40 s "
+                         "with 8, because the startup dominates; 300 steps take "
+                         "56 s with 0 and 51 s with 4, because by then it does "
+                         "not. Worth having for real epochs, not for smoke tests")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-every-steps", type=int, default=200)
     ap.add_argument("--keep-last", type=int, default=3,
@@ -530,20 +625,27 @@ def main() -> int:
 
     micro = args.micro_batch or args.batch_size
     accum = max(1, args.batch_size // max(1, micro))
-    oom = OomPolicy(micro=micro, accum=accum)
+    oom = OomPolicy(micro=micro, accum=accum, ceiling=args.batch_size)
+    vram_cap = 0.0
+    if device.type == "cuda" and args.vram_fraction > 0:
+        vram_cap = args.vram_fraction * torch.cuda.get_device_properties(0).total_memory
 
     def make_loader(pairs, train: bool, batch: int, epoch: int = 0):
-        ds = PairDataset(pairs, p.sr, seg, train, seed=args.seed + epoch)
+        ds = PairDataset(pairs, p.sr, seg, train, seed=args.seed + epoch,
+                         with_features=True, config_path=cfg)
         return DataLoader(ds, batch_size=batch, shuffle=train,
                           num_workers=args.workers, drop_last=train,
-                          pin_memory=(device.type == "cuda"))
+                          pin_memory=(device.type == "cuda"),
+                          persistent_workers=args.workers > 0,
+                          prefetch_factor=4 if args.workers > 0 else None)
 
-    def run_batch(clean_a, noisy_a, snrs):
-        clean_a = clean_a.to(device, non_blocking=True)
-        noisy_a = noisy_a.to(device, non_blocking=True)
-        spec_noisy, feat_erb, feat_spec = build_features(
-            df_state, p.nb_df, noisy_a, device)
-        spec_clean, _, _ = build_features(df_state, p.nb_df, clean_a, device)
+    def run_batch(item):
+        """One step's forward, on features the loader already computed."""
+        spec_clean, spec_noisy, feat_erb, feat_spec, snrs = item
+        spec_clean = spec_clean.to(device, non_blocking=True)
+        spec_noisy = spec_noisy.to(device, non_blocking=True)
+        feat_erb = feat_erb.to(device, non_blocking=True)
+        feat_spec = feat_spec.to(device, non_blocking=True)
         enh, m, lsnr, _ = model.forward(spec=spec_noisy.clone(),
                                         feat_erb=feat_erb, feat_spec=feat_spec)
         # The loss wants the REAL-VALUED spectrogram form, [B, C, T, F, 2], not
@@ -561,10 +663,11 @@ def main() -> int:
         # an error there would train a model for inputs it will never see.
         model.eval()
         loader = make_loader(train_pairs, False, min(4, len(train_pairs)))
-        clean_a, noisy_a, snrs = next(iter(loader))
+        item = next(iter(loader))
         with torch.no_grad():
-            err = run_batch(clean_a, noisy_a, snrs)
-        print(f"\nbase model, one batch of {len(clean_a)}: loss {float(err):.6f}")
+            err = run_batch(item)
+        print()
+        print(f"base model, one batch of {len(item[0])}: loss {float(err):.6f}")
         print("Nothing was written and no weight was changed.")
         print("Sanity to apply before trusting a training run:")
         print("  - the loss is finite and not absurd (order 1e-2..1e1 here)")
@@ -623,71 +726,96 @@ def main() -> int:
     t0 = time.time()
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        loader = make_loader(train_pairs, True, oom.micro, epoch)
         running, seen, micro_i = 0.0, 0, 0
         optimizer.zero_grad(set_to_none=True)
+        epoch_start_step = step
+        # Changing the micro-batch means a new DataLoader, and a new DataLoader
+        # means starting the pass again. The first version simply broke out of
+        # the loop, so every resize - an out-of-memory event or a growth - ended
+        # the epoch early while reporting a normal epoch. `resized` is what
+        # tells the difference between "the data ran out" and "the batch
+        # changed under us".
+        resized = True
+        while resized and not stopping["now"]:
+            resized = False
+            loader = make_loader(train_pairs, True, oom.micro, epoch)
+            for item in loader:
+                try:
+                    if scaler is not None:
+                        with torch.amp.autocast(device.type):
+                            err = run_batch(item) / oom.accum
+                        scaler.scale(err).backward()
+                    else:
+                        err = run_batch(item) / oom.accum
+                        err.backward()
+                except torch.cuda.OutOfMemoryError:
+                    optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    if not oom.shrink(step):
+                        print("out of memory at the smallest micro-batch - stopping "
+                              "and saving", file=sys.stderr)
+                        stopping["now"] = True
+                        break
+                    print(f"  out of memory: micro-batch -> {oom.micro}, "
+                          f"accumulation -> {oom.accum}; the effective batch is "
+                          f"unchanged", file=sys.stderr)
+                    resized = True
+                    break        # rebuilt below; the pass continues
 
-        for clean_a, noisy_a, snrs in loader:
-            try:
-                if scaler is not None:
-                    with torch.amp.autocast(device.type):
-                        err = run_batch(clean_a, noisy_a, snrs) / oom.accum
-                    scaler.scale(err).backward()
-                else:
-                    err = run_batch(clean_a, noisy_a, snrs) / oom.accum
-                    err.backward()
-            except torch.cuda.OutOfMemoryError:
-                optimizer.zero_grad(set_to_none=True)
-                torch.cuda.empty_cache()
-                if not oom.shrink(step):
-                    print("out of memory at the smallest micro-batch - stopping "
-                          "and saving", file=sys.stderr)
-                    stopping["now"] = True
+                running += float(err.detach()) * oom.accum
+                seen += 1
+                micro_i += 1
+                if micro_i % oom.accum == 0:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    # Cut the graph between steps, as upstream's own loop does. The
+                    # network is recurrent; without this any hidden state kept on the
+                    # module stays attached to the previous step's graph, which grows
+                    # the backward pass without bound and makes the gradients wrong
+                    # in a way that shows up as memory, not as an error.
+                    detach_hidden(model)
+                    step += 1
+
+                    # Take the micro-batch back up when the card has room. Peak is
+                    # reset each step so the reading is this step's, not the run's
+                    # high-water mark - otherwise one heavy batch early on would
+                    # keep the run small for ever.
+                    if vram_cap and oom.maybe_grow(
+                            step, torch.cuda.max_memory_allocated(), vram_cap):
+                        print(f"  room to spare: micro-batch -> {oom.micro}, "
+                              f"accumulation -> {oom.accum}; the effective batch "
+                              f"is unchanged", flush=True)
+                        torch.cuda.reset_peak_memory_stats()
+                        resized = True
+                        break        # rebuilt below, and the pass continues
+                    if vram_cap and step % 20 == 0:
+                        torch.cuda.reset_peak_memory_stats()
+
+                    if args.save_every_steps and step % args.save_every_steps == 0:
+                        save_checkpoint(args.out_dir / f"step_{step:07d}.pt",
+                                        model=model, optimizer=optimizer,
+                                        scaler=scaler, epoch=epoch, step=step,
+                                        best=best, args_snapshot=snapshot)
+                        save_checkpoint(args.out_dir / "last.pt", model=model,
+                                        optimizer=optimizer, scaler=scaler,
+                                        epoch=epoch, step=step, best=best,
+                                        args_snapshot=snapshot)
+                        prune_checkpoints(args.out_dir, args.keep_last)
+                        print(f"  epoch {epoch} step {step} "
+                              f"train {running/max(1,seen):.5f}", flush=True)
+
+                    if args.max_steps_per_epoch and \
+                            step - epoch_start_step >= args.max_steps_per_epoch:
+                        break
+                if stopping["now"]:
                     break
-                print(f"  out of memory: micro-batch -> {oom.micro}, "
-                      f"accumulation -> {oom.accum}; the effective batch is "
-                      f"unchanged", file=sys.stderr)
-                break        # rebuild the loader at the new size
-
-            running += float(err.detach()) * oom.accum
-            seen += 1
-            micro_i += 1
-            if micro_i % oom.accum == 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                # Cut the graph between steps, as upstream's own loop does. The
-                # network is recurrent; without this any hidden state kept on the
-                # module stays attached to the previous step's graph, which grows
-                # the backward pass without bound and makes the gradients wrong
-                # in a way that shows up as memory, not as an error.
-                detach_hidden(model)
-                step += 1
-
-                if args.save_every_steps and step % args.save_every_steps == 0:
-                    save_checkpoint(args.out_dir / f"step_{step:07d}.pt",
-                                    model=model, optimizer=optimizer,
-                                    scaler=scaler, epoch=epoch, step=step,
-                                    best=best, args_snapshot=snapshot)
-                    save_checkpoint(args.out_dir / "last.pt", model=model,
-                                    optimizer=optimizer, scaler=scaler,
-                                    epoch=epoch, step=step, best=best,
-                                    args_snapshot=snapshot)
-                    prune_checkpoints(args.out_dir, args.keep_last)
-                    print(f"  epoch {epoch} step {step} "
-                          f"train {running/max(1,seen):.5f}", flush=True)
-
-                if args.max_steps_per_epoch and \
-                        step % max(1, args.max_steps_per_epoch) == 0:
-                    break
-            if stopping["now"]:
-                break
 
         # ---- held-out loss, for the checkpoint selection only ---------------
         valid = float("nan")
@@ -695,9 +823,8 @@ def main() -> int:
             model.eval()
             vs, vn = 0.0, 0
             with torch.no_grad():
-                for clean_a, noisy_a, snrs in make_loader(
-                        valid_pairs, False, oom.micro):
-                    vs += float(run_batch(clean_a, noisy_a, snrs))
+                for item in make_loader(valid_pairs, False, oom.micro):
+                    vs += float(run_batch(item))
                     vn += 1
                     if vn >= 50:      # enough to rank checkpoints, not a result
                         break
