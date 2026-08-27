@@ -460,6 +460,7 @@ class Progress:
     """
 
     def __init__(self, every: float = 10.0):
+        # every <= 0 silences it entirely, which is what --quiet sets.
         self.every = every
         self.last = 0.0
         self.t0 = time.time()
@@ -475,7 +476,9 @@ class Progress:
             # that took nine seconds.
             self.stage = (stage, epoch)
             self.t0 = now
-        if not force and (self.every <= 0 or now - self.last < self.every):
+        if self.every <= 0:
+            return                    # --quiet, and forced lines are silenced too
+        if not force and now - self.last < self.every:
             return
         self.last = now
         elapsed = now - self.t0
@@ -556,6 +559,14 @@ def main() -> int:
                          "56 s with 0 and 51 s with 4, because by then it does "
                          "not. Worth having for real epochs, not for smoke tests")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--quiet", action="store_true", default=None,
+                    help="print only what a reader needs afterwards: the final "
+                         "loss, the checkpoint, and anything that went wrong. "
+                         "Defaults ON when stdout is not a terminal, because "
+                         "then nobody is watching it scroll - a piped or "
+                         "captured run pays for every line and reads none of "
+                         "them. --no-quiet forces the full output back")
+    ap.add_argument("--no-quiet", dest="quiet", action="store_false")
     ap.add_argument("--progress-seconds", type=float, default=10.0,
                     help="how often to print a progress line; 0 prints "
                          "only at the end of each stage")
@@ -585,6 +596,24 @@ def main() -> int:
                     help="run the base model over one batch, print the loss, "
                          "change nothing, exit")
     args = ap.parse_args()
+    if args.quiet is None:
+        args.quiet = not sys.stdout.isatty()
+    if args.quiet:
+        args.progress_seconds = 0.0
+        # The df package logs its own INFO lines through loguru, and they are
+        # most of the noise: a model init and a checkpoint path per run.
+        try:
+            from loguru import logger
+
+            logger.remove()
+            logger.add(sys.stderr, level="WARNING")
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def say(*a, **kw):
+        """Progress talk. Silent when nobody is reading."""
+        if not args.quiet:
+            say(*a, **kw)
 
     try:
         from df.checkpoint import load_model
@@ -599,7 +628,7 @@ def main() -> int:
 
     cfg = args.model_base_dir / "config.ini"
     if not cfg.exists():
-        print(f"no config.ini in {args.model_base_dir} - point --model-base-dir "
+        say(f"no config.ini in {args.model_base_dir} - point --model-base-dir "
               f"at a DeepFilterNet checkpoint directory", file=sys.stderr)
         return 2
     config.load(str(cfg), allow_defaults=True)
@@ -615,7 +644,7 @@ def main() -> int:
         # slower, the machine starts swapping, and nothing says so.
         torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
         total = torch.cuda.get_device_properties(0).total_memory
-        print(f"VRAM cap {args.vram_fraction:.0%} of {total / 1e9:.1f} GB = "
+        say(f"VRAM cap {args.vram_fraction:.0%} of {total / 1e9:.1f} GB = "
               f"{args.vram_fraction * total / 1e9:.1f} GB - past it the run "
               f"raises instead of spilling into system RAM")
     p = ModelParams()
@@ -643,7 +672,7 @@ def main() -> int:
     model, base_epoch = load_model(str(cp_dir), df_state, epoch="best")
     if base_epoch == 0:
         print(f"no checkpoint was loaded from {cp_dir}.", file=sys.stderr)
-        print("`read_cp` looks for model*.ckpt or model*.ckpt.best there. "
+        say("`read_cp` looks for model*.ckpt or model*.ckpt.best there. "
               "Without one the network is randomly initialised, and "
               "training would start from noise while reporting nothing "
               "wrong.", file=sys.stderr)
@@ -651,7 +680,7 @@ def main() -> int:
     model = model.to(device)
 
     trainable, total = freeze_parts(model, args.freeze)
-    print(f"model: {total/1e6:.2f} M parameters, {trainable/1e6:.2f} M trainable "
+    say(f"model: {total/1e6:.2f} M parameters, {trainable/1e6:.2f} M trainable "
           f"(--freeze {args.freeze}), base epoch {base_epoch}, device {device}")
 
     istft = Istft(p.fft_size, p.hop_size,
@@ -664,7 +693,7 @@ def main() -> int:
     if not train_pairs:
         print(f"no training pairs under {args.data_dir}", file=sys.stderr)
         return 2
-    print(f"data: {len(train_pairs)} train pair(s), {len(valid_pairs)} held out, "
+    say(f"data: {len(train_pairs)} train pair(s), {len(valid_pairs)} held out, "
           f"{args.seg_seconds:.1f} s crops at {p.sr} Hz")
 
     micro = args.micro_batch or args.batch_size
@@ -710,13 +739,13 @@ def main() -> int:
         item = next(iter(loader))
         with torch.no_grad():
             err = run_batch(item)
-        print()
+        say()
         print(f"base model, one batch of {len(item[0])}: loss {float(err):.6f}")
-        print("Nothing was written and no weight was changed.")
-        print("Sanity to apply before trusting a training run:")
-        print("  - the loss is finite and not absurd (order 1e-2..1e1 here)")
-        print("  - it is LOWER on the held-out set than on random noise pairs")
-        print("  - it does not change between two runs with the same seed")
+        say("Nothing was written and no weight was changed.")
+        say("Sanity to apply before trusting a training run:")
+        say("  - the loss is finite and not absurd (order 1e-2..1e1 here)")
+        say("  - it is LOWER on the held-out set than on random noise pairs")
+        say("  - it does not change between two runs with the same seed")
         return 0
 
     params = [q for q in model.parameters() if q.requires_grad]
@@ -744,7 +773,7 @@ def main() -> int:
                              scaler=scaler)
         start_epoch, step = int(ck.get("epoch", 0)), int(ck.get("step", 0))
         best = float(ck.get("best", float("inf")))
-        print(f"resumed from {resume_path} at epoch {start_epoch}, step {step}, "
+        say(f"resumed from {resume_path} at epoch {start_epoch}, step {step}, "
               f"best {best:.6f}")
 
     log_path = args.out_dir / "train_log.csv"
@@ -760,7 +789,7 @@ def main() -> int:
         # One checkpoint, then leave. A run killed between the notice and the
         # write would lose the epoch, and the whole point of this block is that
         # hours of GPU time survive an interruption.
-        print(f"\nsignal {signum} - writing a checkpoint before exiting")
+        say(f"\nsignal {signum} - writing a checkpoint before exiting")
         stopping["now"] = True
 
     signal.signal(signal.SIGINT, on_signal)
@@ -774,7 +803,7 @@ def main() -> int:
     steps_per_epoch = max(1, len(train_pairs) // max(1, args.batch_size))
     if args.max_steps_per_epoch:
         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
-    print(f"one epoch is about {steps_per_epoch} optimizer step(s) over "
+    say(f"one epoch is about {steps_per_epoch} optimizer step(s) over "
           f"{len(train_pairs)} pair(s)")
 
     t0 = time.time()
@@ -806,11 +835,11 @@ def main() -> int:
                     optimizer.zero_grad(set_to_none=True)
                     torch.cuda.empty_cache()
                     if not oom.shrink(step):
-                        print("out of memory at the smallest micro-batch - stopping "
+                        say("out of memory at the smallest micro-batch - stopping "
                               "and saving", file=sys.stderr)
                         stopping["now"] = True
                         break
-                    print(f"  out of memory: micro-batch -> {oom.micro}, "
+                    say(f"  out of memory: micro-batch -> {oom.micro}, "
                           f"accumulation -> {oom.accum}; the effective batch is "
                           f"unchanged", file=sys.stderr)
                     resized = True
@@ -843,7 +872,7 @@ def main() -> int:
                     # keep the run small for ever.
                     if vram_cap and oom.maybe_grow(
                             step, torch.cuda.max_memory_allocated(), vram_cap):
-                        print(f"  room to spare: micro-batch -> {oom.micro}, "
+                        say(f"  room to spare: micro-batch -> {oom.micro}, "
                               f"accumulation -> {oom.accum}; the effective batch "
                               f"is unchanged", flush=True)
                         torch.cuda.reset_peak_memory_stats()
@@ -862,7 +891,7 @@ def main() -> int:
                                         epoch=epoch, step=step, best=best,
                                         args_snapshot=snapshot)
                         prune_checkpoints(args.out_dir, args.keep_last)
-                        print(f"  epoch {epoch} step {step} "
+                        say(f"  epoch {epoch} step {step} "
                               f"train {running/max(1,seen):.5f}", flush=True)
 
                     prog.show("train", epoch, args.epochs,
@@ -915,11 +944,11 @@ def main() -> int:
             print(f"  new best; upstream-format weights at {cp.name}")
 
         if stopping["now"]:
-            print("stopped early; last.pt holds the current state")
+            say("stopped early; last.pt holds the current state")
             break
 
     if device.type == "cuda":
-        print()
+        say()
         print(f"peak VRAM: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
     if oom.events:
@@ -929,9 +958,10 @@ def main() -> int:
                   f"accumulation {e['accum']}")
 
     print(f"\ncheckpoints in {args.out_dir}")
-    print("The held-out loss ranks checkpoints. It does NOT say the model is "
-          "better on the air:\nscore the result on real recordings before "
-          "believing anything about it.")
+    if not args.quiet:
+        print("The held-out loss ranks checkpoints. It does NOT say the model "
+              "is better on the air: score the result on real recordings "
+              "before believing anything about it.")
     return 0
 
 
