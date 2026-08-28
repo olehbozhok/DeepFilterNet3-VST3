@@ -15,8 +15,10 @@ default = ["model-ll"]
 #   model-ll         DeepFilterNet's own low-latency model (the default)
 #   model-standard   DeepFilterNet's own standard model
 #   model-shortwave  the model this project trained for shortwave AM speech,
-#                    bundled at models/dfn3-shortwave-v1_onnx.tar.gz. Override
-#                    with DEEPFILTER_EMBED_MODEL to compile in a different one.
+#                    bundled at models/dfn3-shortwave-v1_onnx.tar.gz. Always
+#                    that one, so a clone builds the same binary.
+#   model-custom     the archive named by DEEPFILTER_EMBED_MODEL, for trying a
+#                    candidate before adopting it. Fails the build if unset.
 #   none             no model in the binary; DEEPFILTER_MODEL is required at
 #                    run time and the plugin refuses to start without it.
 #
@@ -26,6 +28,7 @@ default = ["model-ll"]
 model-ll = ["df/default-model-ll"]
 model-standard = ["df/default-model"]
 model-shortwave = []
+model-custom = []
 
 [dependencies]
 nice-plug = "=0.2.3"

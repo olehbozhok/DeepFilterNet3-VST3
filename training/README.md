@@ -155,11 +155,17 @@ model that ships is versioned with the code that ships it, and the build needs
 nothing from the environment to be reproducible. Ours is 8.0 MB; the one cargo
 already pulls in from upstream is 34.7 MB.
 
-To compile in a different one - a new candidate, before it is adopted:
+To compile in a different one - a new candidate, before it is adopted - use the
+OTHER feature:
 
 ```bash
-DEEPFILTER_EMBED_MODEL=<path-to>_onnx.tar.gz   cargo build --release -p deepfilter-vst   --no-default-features --features model-shortwave
+DEEPFILTER_EMBED_MODEL=<path-to>_onnx.tar.gz   cargo build --release -p deepfilter-vst   --no-default-features --features model-custom
 ```
+
+The override has its own feature so that the build command always says which
+model it produces. When it was a hidden switch on `model-shortwave`, two people
+running the same command could get different weights with nothing to show it -
+`model-shortwave` now ignores the variable and warns that it did.
 
 `build.rs` resolves the path, because `include_bytes!` needs a literal and
 cannot make that choice, and declares both the variable and the resolved file as

@@ -9,10 +9,13 @@
 #[cfg(any(
     all(feature = "model-ll", feature = "model-standard"),
     all(feature = "model-ll", feature = "model-shortwave"),
+    all(feature = "model-ll", feature = "model-custom"),
     all(feature = "model-standard", feature = "model-shortwave"),
+    all(feature = "model-standard", feature = "model-custom"),
+    all(feature = "model-shortwave", feature = "model-custom"),
 ))]
 compile_error!(
-    "enable at most one of model-ll, model-standard, model-shortwave"
+    "enable at most one of model-ll, model-standard, model-shortwave, model-custom"
 );
 
 mod bridge;

@@ -17,14 +17,22 @@ Project instructions for coding agents working in this repository.
 
 - Use nice-plug and nice-plug-xtask. Do not reintroduce nih-plug.
 - Enable AT MOST one embedded model feature; a build with none is legal and
-  deliberate. The default is `model-ll`; the alternates are
-  `--no-default-features --features model-standard`,
-  `--no-default-features --features model-shortwave` (compiles in
-  `plugin/models/dfn3-shortwave-v1_onnx.tar.gz`, or whatever
-  `DEEPFILTER_EMBED_MODEL` names instead), and `--no-default-features`
-  alone, which carries no model and requires `DEEPFILTER_MODEL` at run time.
+  deliberate. The four shapes:
+
+  | build | what it carries |
+  | :-- | :-- |
+  | default | `model-ll`, DeepFilterNet's low-latency model |
+  | `--no-default-features --features model-standard` | DeepFilterNet's standard model |
+  | `--no-default-features --features model-shortwave` | `plugin/models/dfn3-shortwave-v1_onnx.tar.gz`, always that one |
+  | `--no-default-features --features model-custom` | the archive `DEEPFILTER_EMBED_MODEL` names; the build fails if it names nothing |
+  | `--no-default-features` | nothing; `DEEPFILTER_MODEL` is required at run time |
+
   Two at once is a compile error: the variants differ in lookahead, so a binary
   holding both could report the wrong latency to the host.
+- `model-shortwave` IGNORES `DEEPFILTER_EMBED_MODEL` and warns that it did. The
+  override lives in its own feature on purpose - when one feature quietly
+  changed what it embedded, two people could run the same build command and get
+  different weights with nothing in the command to say so.
 - A build with no model must FAIL to construct an engine, with a message naming
   `DEEPFILTER_MODEL`. It must never fall back to another model: a plugin that
   silently passes audio through something nobody chose makes every listening
