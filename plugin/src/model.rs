@@ -12,31 +12,29 @@ use std::path::{Path, PathBuf};
 // describe the wrong one.
 #[cfg(any(
     all(feature = "model-ll", feature = "model-standard"),
-    all(feature = "model-ll", feature = "model-embedded"),
-    all(feature = "model-standard", feature = "model-embedded"),
+    all(feature = "model-ll", feature = "model-shortwave"),
+    all(feature = "model-standard", feature = "model-shortwave"),
 ))]
 compile_error!(
-    "enable at most one of model-ll, model-standard, model-embedded -      the default build is model-ll, and any other needs --no-default-features"
+    "enable at most one of model-ll, model-standard, model-shortwave -      the default build is model-ll, and any other needs --no-default-features"
 );
 
 /// The archive compiled into this build, if any.
 ///
-/// `model-embedded` takes the path from DEEPFILTER_EMBED_MODEL at COMPILE time,
-/// so a fine-tuned model can be shipped inside the plugin without the archive
-/// having to live in this repository. build.rs marks both the variable and the
-/// file it names as build inputs, so retraining the model rebuilds the plugin
-/// rather than leaving stale weights behind a fresh path.
-#[cfg(feature = "model-embedded")]
-const EMBEDDED_MODEL: &[u8] = include_bytes!(env!(
-    "DEEPFILTER_EMBED_MODEL",
-    "building with --features model-embedded requires DEEPFILTER_EMBED_MODEL      to name a *_onnx.tar.gz produced by DeepFilterNet's export.py"
-));
+/// The path is resolved by build.rs - the bundled shortwave model by default,
+/// or whatever `DEEPFILTER_EMBED_MODEL` names - and handed back through
+/// `cargo:rustc-env`, because `include_bytes!` needs a literal and cannot make
+/// that choice itself. build.rs also declares the resolved file as a build
+/// input, so retraining the model rebuilds the plugin instead of leaving stale
+/// weights behind a fresh path.
+#[cfg(feature = "model-shortwave")]
+const EMBEDDED_MODEL: &[u8] = include_bytes!(env!("DEEPFILTER_EMBED_MODEL"));
 
 /// Whether this build carries a model at all.
 pub(crate) const HAS_EMBEDDED_MODEL: bool = cfg!(any(
     feature = "model-ll",
     feature = "model-standard",
-    feature = "model-embedded"
+    feature = "model-shortwave"
 ));
 
 /// Fixed timing expected by the embedded official DeepFilterNet model.
@@ -139,7 +137,7 @@ pub(crate) enum ModelSource<'a> {
 /// model chooser is not a mix control. This is a developer's door, not a user's.
 pub(crate) const MODEL_PATH_ENV: &str = "DEEPFILTER_MODEL";
 
-#[cfg(feature = "model-embedded")]
+#[cfg(feature = "model-shortwave")]
 fn embedded_params() -> Result<DfParams, ModelError> {
     // Leaked for the same reason as ModelSource::Bytes, except that here the
     // slice is already 'static - it is in the binary - so nothing is leaked at
@@ -148,7 +146,7 @@ fn embedded_params() -> Result<DfParams, ModelError> {
         .map_err(|error| ModelError::new(format!("the embedded model is unreadable: {error}")))
 }
 
-#[cfg(all(not(feature = "model-embedded"), any(feature = "model-ll", feature = "model-standard")))]
+#[cfg(all(not(feature = "model-shortwave"), any(feature = "model-ll", feature = "model-standard")))]
 fn embedded_params() -> Result<DfParams, ModelError> {
     // DfParams::default() PANICS when DeepFilterNet was built without a model
     // feature, which is why this function is only compiled when one is present:
@@ -156,10 +154,10 @@ fn embedded_params() -> Result<DfParams, ModelError> {
     Ok(DfParams::default())
 }
 
-#[cfg(not(any(feature = "model-ll", feature = "model-standard", feature = "model-embedded")))]
+#[cfg(not(any(feature = "model-ll", feature = "model-standard", feature = "model-shortwave")))]
 fn embedded_params() -> Result<DfParams, ModelError> {
     Err(ModelError::new(
-        "this build carries no model. Set DEEPFILTER_MODEL to a *_onnx.tar.gz,          or rebuild with one of --features model-ll / model-standard / model-embedded",
+        "this build carries no model. Set DEEPFILTER_MODEL to a *_onnx.tar.gz,          or rebuild with one of --features model-ll / model-standard / model-shortwave",
     ))
 }
 
@@ -320,7 +318,7 @@ mod tests {
     /// silently falls back to some other model and passes audio, so every
     /// listening judgement afterwards is about a model nobody chose.
     #[cfg(not(any(feature = "model-ll", feature = "model-standard",
-                  feature = "model-embedded")))]
+                  feature = "model-shortwave")))]
     #[test]
     fn a_build_with_no_model_refuses_clearly() {
         let error = DfEngine::from_source(ModelSource::Embedded)
@@ -328,7 +326,7 @@ mod tests {
             .expect("a build with no model must not construct an engine");
         let text = error.to_string();
         assert!(text.contains("DEEPFILTER_MODEL"), "{text}");
-        assert!(text.contains("model-embedded"), "{text}");
+        assert!(text.contains("model-shortwave"), "{text}");
     }
 
     /// An embedded model must be the one that was named, not a default.
@@ -337,7 +335,7 @@ mod tests {
     /// embedded: the test then asserts that loading it from disk and using the
     /// compiled-in copy describe the same model. A build that quietly fell back
     /// to DeepFilterNet's own model would differ in lookahead and fail here.
-    #[cfg(feature = "model-embedded")]
+    #[cfg(feature = "model-shortwave")]
     #[test]
     fn the_embedded_model_is_the_one_that_was_named() {
         let _serial = crate::test_support::serialize_real_model();

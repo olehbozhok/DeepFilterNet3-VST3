@@ -8,11 +8,11 @@
 // and for comparing two of them without recompiling between.
 #[cfg(any(
     all(feature = "model-ll", feature = "model-standard"),
-    all(feature = "model-ll", feature = "model-embedded"),
-    all(feature = "model-standard", feature = "model-embedded"),
+    all(feature = "model-ll", feature = "model-shortwave"),
+    all(feature = "model-standard", feature = "model-shortwave"),
 ))]
 compile_error!(
-    "enable at most one of model-ll, model-standard, model-embedded"
+    "enable at most one of model-ll, model-standard, model-shortwave"
 );
 
 mod bridge;

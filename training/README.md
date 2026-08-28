@@ -146,13 +146,26 @@ DEEPFILTER_MODEL=<path-to>_onnx.tar.gz   # then start the host
 **Compiled in**, for shipping one:
 
 ```bash
-DEEPFILTER_EMBED_MODEL=<path-to>_onnx.tar.gz   cargo build --release -p deepfilter-vst   --no-default-features --features model-embedded
+cargo build --release -p deepfilter-vst   --no-default-features --features model-shortwave
 ```
 
-The archive does not have to live in this repository - the path is read at build
-time, and `build.rs` marks both the variable and the file as build inputs, so
-retraining the model rebuilds the plugin instead of leaving stale weights behind
-a fresh path.
+That embeds `plugin/models/dfn3-shortwave-v1_onnx.tar.gz`, which is in this
+repository for the same reason DeepFilterNet keeps its own models in its - the
+model that ships is versioned with the code that ships it, and the build needs
+nothing from the environment to be reproducible. Ours is 8.0 MB; the one cargo
+already pulls in from upstream is 34.7 MB.
+
+To compile in a different one - a new candidate, before it is adopted:
+
+```bash
+DEEPFILTER_EMBED_MODEL=<path-to>_onnx.tar.gz   cargo build --release -p deepfilter-vst   --no-default-features --features model-shortwave
+```
+
+`build.rs` resolves the path, because `include_bytes!` needs a literal and
+cannot make that choice, and declares both the variable and the resolved file as
+build inputs - so retraining the model rebuilds the plugin instead of leaving
+stale weights behind a fresh path. A missing archive stops the build rather than
+falling back to another model.
 
 **With no model at all**, which then requires `DEEPFILTER_MODEL`:
 

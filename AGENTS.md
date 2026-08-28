@@ -19,8 +19,9 @@ Project instructions for coding agents working in this repository.
 - Enable AT MOST one embedded model feature; a build with none is legal and
   deliberate. The default is `model-ll`; the alternates are
   `--no-default-features --features model-standard`,
-  `--no-default-features --features model-embedded` (compiles in the archive
-  named by `DEEPFILTER_EMBED_MODEL` at build time), and `--no-default-features`
+  `--no-default-features --features model-shortwave` (compiles in
+  `plugin/models/dfn3-shortwave-v1_onnx.tar.gz`, or whatever
+  `DEEPFILTER_EMBED_MODEL` names instead), and `--no-default-features`
   alone, which carries no model and requires `DEEPFILTER_MODEL` at run time.
   Two at once is a compile error: the variants differ in lookahead, so a binary
   holding both could report the wrong latency to the host.

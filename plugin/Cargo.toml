@@ -10,13 +10,22 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["model-ll"]
-# Exactly one of these, or none. `model-embedded` compiles in a model of our own
-# from the path in DEEPFILTER_EMBED_MODEL, and pulls in no DeepFilterNet model
-# feature at all, so the two are never both present. With none of them the
-# plugin carries no model and requires DEEPFILTER_MODEL at run time.
+# At most one of these, or none.
+#
+#   model-ll         DeepFilterNet's own low-latency model (the default)
+#   model-standard   DeepFilterNet's own standard model
+#   model-shortwave  the model this project trained for shortwave AM speech,
+#                    bundled at models/dfn3-shortwave-v1_onnx.tar.gz. Override
+#                    with DEEPFILTER_EMBED_MODEL to compile in a different one.
+#   none             no model in the binary; DEEPFILTER_MODEL is required at
+#                    run time and the plugin refuses to start without it.
+#
+# Each brings in at most one DeepFilterNet model feature, so two can never be
+# embedded together - they differ in lookahead, and a binary holding both could
+# report the wrong latency to the host.
 model-ll = ["df/default-model-ll"]
 model-standard = ["df/default-model"]
-model-embedded = []
+model-shortwave = []
 
 [dependencies]
 nice-plug = "=0.2.3"
