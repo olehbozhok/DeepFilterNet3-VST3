@@ -131,7 +131,7 @@ Clone the repository and build the default low-latency model:
 ```bash
 git clone https://github.com/Shuichi346/DeepFilterNet3-VST3.git
 cd DeepFilterNet3-VST3
-cargo xtask bundle deepfilter-vst --release
+cargo xtask bundle deepfilter-vst --release --features plugin
 ```
 
 Generated bundles:
@@ -144,10 +144,18 @@ target/bundled/deepfilter-vst.clap
 To build the official standard model instead of the default low-latency model:
 
 ```bash
-cargo xtask bundle deepfilter-vst --release --no-default-features --features model-standard
+cargo xtask bundle deepfilter-vst --release --no-default-features --features plugin,model-standard
 ```
 
 The model features are mutually exclusive. Exactly one of `model-ll` or `model-standard` must be enabled.
+
+The VST3/CLAP layer itself is the non-default `plugin` feature, so every
+`cargo xtask bundle` command must name it. A build without `plugin` is the
+DeepFilterNet core library: `dsp`, `model`, `resampler`, and `worker`, with
+`DspCore`, `DfEngine`, `RatePlan`, and `WorkerHandle` at the crate root, and no
+nice-plug, nice-plug-egui, or egui in the dependency graph. Another project
+consumes it as a dependency with `default-features = false` and picks a model
+feature explicitly, or none at all to load `DEEPFILTER_MODEL` at run time.
 
 ## Install
 
@@ -193,7 +201,7 @@ changes remain synchronized with the sliders.
 Build a debug bundle with nice-plug's callback allocation assertions:
 
 ```bash
-cargo xtask bundle deepfilter-vst --features nice-plug/assert_process_allocs
+cargo xtask bundle deepfilter-vst --features plugin,nice-plug/assert_process_allocs
 ```
 
 Run the bounded library and plugin validation gate:
@@ -211,7 +219,7 @@ The VST3 bundle used for pluginval should be the allocation-asserting debug arti
 Create the Apple Silicon release package after building the release bundles:
 
 ```bash
-cargo xtask bundle deepfilter-vst --release
+cargo xtask bundle deepfilter-vst --release --features plugin
 ./scripts/package-release.sh
 ```
 
@@ -235,15 +243,16 @@ script does not install or publish anything.
 ## Project structure
 
 ```text
-plugin/src/lib.rs        Plugin metadata, lifecycle, host layouts, and exports
-plugin/src/params.rs     Attenuation Limit and Mix parameters
-plugin/src/editor.rs     Fixed-size English two-slider custom editor
-plugin/src/bridge.rs     Callback-side buffering, alignment, and fallback
-plugin/src/dsp.rs        Worker DSP core and latency calculation
-plugin/src/model.rs      DeepFilterNet model wrapper and metadata
-plugin/src/resampler.rs  Checked persistent sample-rate conversion
-plugin/src/worker.rs     Worker lifecycle, queues, reset, and status
-xtask/                   VST3/CLAP bundle command
+plugin/src/lib.rs        Core exports plus the gated plugin metadata, lifecycle, and host layouts
+plugin/src/params.rs     Attenuation Limit and Mix parameters (plugin feature)
+plugin/src/editor.rs     Fixed-size English two-slider custom editor (plugin feature)
+plugin/src/bridge.rs     Callback-side buffering, alignment, and fallback (plugin feature)
+plugin/src/dsp.rs        Public worker DSP core and latency calculation
+plugin/src/model.rs      Public DeepFilterNet model wrapper and metadata
+plugin/src/resampler.rs  Public checked persistent sample-rate conversion
+plugin/src/worker.rs     Public worker lifecycle, queues, reset, and status
+plugin/tests/core_api.rs Proves the core surface is usable without the plugin layer
+xtask/                   Guarded VST3/CLAP bundle command
 scripts/                 Release packaging tools
 ```
 
@@ -256,7 +265,7 @@ If a host keeps discovering an older local build, clean and recreate the release
 
 ```bash
 cargo clean
-cargo xtask bundle deepfilter-vst --release
+cargo xtask bundle deepfilter-vst --release --features plugin
 ```
 
 Confirm that the VST3 or CLAP directory matches the installation paths above, then restart or rescan the host. A locally built bundle is not Developer ID signed or notarized, so macOS host security behavior may differ from a distributed signed plugin.

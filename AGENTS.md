@@ -26,8 +26,16 @@ Project instructions for coding agents working in this repository.
 - Treat DeepFilterNet, ndarray, Tract, and rubato as a shared compatibility
   boundary; assess model APIs and resampling/latency behavior before upgrading
   them independently.
+- The VST3/CLAP layer is the non-default `plugin` feature: `bridge.rs`,
+  `editor.rs`, `params.rs`, and the `Plugin`/`ClapPlugin`/`Vst3Plugin` impls.
+  Every `cargo xtask bundle` names it, and `xtask` refuses to bundle without
+  it. The default build is the core library (`dsp`, `model`, `resampler`,
+  `worker`) and must not pull nice-plug, nice-plug-egui, or egui. Keep those
+  modules' public API re-exported from `lib.rs`, and keep
+  `plugin/tests/core_api.rs` compiling in every shape.
 - Enable AT MOST one embedded model feature; a build with none is legal and
-  deliberate. The four shapes:
+  deliberate. The four shapes (add `plugin` to any of them for the plugin
+  layer, e.g. `--features plugin,model-standard`):
 
   | build | what it carries |
   | :-- | :-- |

@@ -7,9 +7,11 @@ use crate::worker::MAX_HOST_QUANTUM;
 
 /// Exact frame geometry derived without constructing a resampler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RatePlan {
-    pub(crate) host_sample_rate: usize,
-    pub(crate) host_quantum: usize,
+pub struct RatePlan {
+    /// The rate the host feeds, in hertz.
+    pub host_sample_rate: usize,
+    /// One exact host chunk: what [`crate::DspCore`] consumes and produces.
+    pub host_quantum: usize,
     host_to_model: ConverterPlan,
     model_to_host: ConverterPlan,
 }
@@ -23,7 +25,7 @@ struct ConverterPlan {
 
 impl RatePlan {
     /// Validate the supported exact fixed-frame rate geometry without allocating rubato state.
-    pub(crate) fn preflight(host_sample_rate: usize) -> Result<Self, RateError> {
+    pub fn preflight(host_sample_rate: usize) -> Result<Self, RateError> {
         if host_sample_rate == 0 {
             return Err(RateError::new("host sample rate must not be zero"));
         }
@@ -67,7 +69,8 @@ impl RatePlan {
         })
     }
 
-    pub(crate) fn verify_model(&self, info: ModelInfo) -> Result<(), RateError> {
+    /// Reject a model whose rate or hop differs from the supported geometry.
+    pub fn verify_model(&self, info: ModelInfo) -> Result<(), RateError> {
         if info.sample_rate != MODEL_SAMPLE_RATE || info.hop_size != MODEL_HOP_SIZE {
             return Err(RateError::new("embedded model rate or hop differs from supported geometry"));
         }
@@ -261,7 +264,7 @@ fn ceil_div(value: usize, divisor: usize) -> Result<usize, RateError> {
 
 /// Small owned construction and conversion error kept off the callback boundary.
 #[derive(Debug)]
-pub(crate) struct RateError(String);
+pub struct RateError(String);
 
 impl RateError {
     fn new(message: impl Into<String>) -> Self {

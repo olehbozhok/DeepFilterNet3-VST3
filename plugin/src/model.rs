@@ -42,19 +42,26 @@ pub(crate) const HAS_EMBEDDED_MODEL: bool = cfg!(any(
 ));
 
 /// Fixed timing expected by the embedded official DeepFilterNet model.
-pub(crate) const MODEL_SAMPLE_RATE: usize = 48_000;
-pub(crate) const MODEL_HOP_SIZE: usize = 480;
+pub const MODEL_SAMPLE_RATE: usize = 48_000;
+/// One inference frame, in samples at [`MODEL_SAMPLE_RATE`].
+pub const MODEL_HOP_SIZE: usize = 480;
 const MIN_EFFECTIVE_ATTENUATION_DB: f32 = 0.01;
 
 /// Immutable metadata derived from the constructed embedded model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ModelInfo {
-    pub(crate) sample_rate: usize,
-    pub(crate) channels: usize,
-    pub(crate) hop_size: usize,
-    pub(crate) fft_size: usize,
-    pub(crate) lookahead: usize,
-    pub(crate) algorithmic_delay: usize,
+pub struct ModelInfo {
+    /// Sample rate the model runs at; [`MODEL_SAMPLE_RATE`] for DeepFilterNet3.
+    pub sample_rate: usize,
+    /// Input channels. This pipeline is mono; always one.
+    pub channels: usize,
+    /// Samples per inference frame at the model rate.
+    pub hop_size: usize,
+    /// Analysis window length at the model rate.
+    pub fft_size: usize,
+    /// Model lookahead in frames (0 for `model-ll`, 2 for `model-standard`).
+    pub lookahead: usize,
+    /// Total intrinsic delay: `fft_size - hop_size + lookahead * hop_size`.
+    pub algorithmic_delay: usize,
 }
 
 impl ModelInfo {
@@ -94,7 +101,7 @@ impl ModelInfo {
 
 /// Small owned error type kept on the worker side of the audio boundary.
 #[derive(Debug)]
-pub(super) struct ModelError(String);
+pub struct ModelError(String);
 
 impl ModelError {
     fn new(message: impl Into<String>) -> Self {
@@ -108,8 +115,8 @@ impl std::fmt::Display for ModelError {
     }
 }
 
-/// A non-`Send` model engine that exists only on the persistent worker thread.
-pub(super) struct DfEngine {
+/// A non-`Send` model engine; it exists only on the thread that runs inference.
+pub struct DfEngine {
     pristine: DfTract,
     active: DfTract,
     input: Array2<f32>,
@@ -125,7 +132,7 @@ pub(super) struct DfEngine {
 /// it in means rebuilding the plugin for every training run, and comparing two
 /// models by ear then means two builds. A path or a buffer costs nothing at
 /// runtime and keeps that loop to seconds.
-pub(crate) enum ModelSource<'a> {
+pub enum ModelSource<'a> {
     /// The model compiled in by the `model-ll` or `model-standard` feature.
     Embedded,
     /// A `*_onnx.tar.gz` on disk, as produced by DeepFilterNet's `export.py`.
@@ -139,7 +146,7 @@ pub(crate) enum ModelSource<'a> {
 /// An environment variable rather than a control in the editor: the editor is
 /// specified to hold exactly two parameter sliders and nothing else, and a
 /// model chooser is not a mix control. This is a developer's door, not a user's.
-pub(crate) const MODEL_PATH_ENV: &str = "DEEPFILTER_MODEL";
+pub const MODEL_PATH_ENV: &str = "DEEPFILTER_MODEL";
 
 #[cfg(any(feature = "model-shortwave", feature = "model-custom"))]
 fn embedded_params() -> Result<DfParams, ModelError> {
@@ -200,7 +207,7 @@ impl DfEngine {
     /// fallback to the embedded one: someone who set the variable wants that
     /// model, and quietly running a different one would make every measurement
     /// afterwards a lie about which model produced it.
-    pub(super) fn new() -> Result<Self, ModelError> {
+    pub fn new() -> Result<Self, ModelError> {
         match std::env::var_os(MODEL_PATH_ENV) {
             Some(path) if !path.is_empty() => {
                 Self::from_source(ModelSource::File(PathBuf::from(path)))
@@ -210,16 +217,17 @@ impl DfEngine {
     }
 
     /// Build from an archive already in memory.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, ModelError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ModelError> {
         Self::from_source(ModelSource::Bytes(bytes))
     }
 
     /// Build from a `*_onnx.tar.gz` on disk.
-    pub(crate) fn from_path(path: &Path) -> Result<Self, ModelError> {
+    pub fn from_path(path: &Path) -> Result<Self, ModelError> {
         Self::from_source(ModelSource::File(path.to_path_buf()))
     }
 
-    pub(crate) fn from_source(source: ModelSource<'_>) -> Result<Self, ModelError> {
+    /// Build from any [`ModelSource`]; the three constructors above are shorthands.
+    pub fn from_source(source: ModelSource<'_>) -> Result<Self, ModelError> {
         let params = params_from(source)?;
         let runtime = RuntimeParams::default_with_ch(1);
         let pristine = DfTract::new(params, &runtime)
@@ -239,12 +247,13 @@ impl DfEngine {
         })
     }
 
-    pub(super) fn info(&self) -> ModelInfo {
+    /// The geometry the constructed model reports.
+    pub fn info(&self) -> ModelInfo {
         self.info
     }
 
     /// Restore a pristine model and reusable frames before acknowledging reset.
-    pub(super) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.active = self.pristine.clone();
         self.input.fill(0.0);
         self.output.fill(0.0);
@@ -252,7 +261,7 @@ impl DfEngine {
     }
 
     /// Process one exact mono model hop with the requested attenuation limit.
-    pub(super) fn process_hop(
+    pub fn process_hop(
         &mut self,
         samples: &[f32],
         requested_attenuation: f32,

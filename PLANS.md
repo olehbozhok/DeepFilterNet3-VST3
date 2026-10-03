@@ -24,8 +24,16 @@ This is the sole authoritative checklist. `UPDATE_PLANS.md` remains the original
 - [x] V13.3: Build optimized bundles, package under an unused dependency-update suffix using the release script, and inspect documentation/notices and diff (20 minutes build; two packaging executions maximum).
 - [x] D13: Update current dependency/compiler documentation and record verification and remaining manual-host limits.
 
-Current: Complete — recommended dependency upgrades and automated acceptance.
-Next: None for this request. Manual Resolve acceptance remains deferred; installation and publication were not performed.
+- [x] I14: Moved the VST3/CLAP layer behind the non-default `plugin` feature and exposed `dsp`, `model`, `resampler`, and `worker` as the public core API, so the fork can be consumed without nice-plug/egui while still merging upstream. Source: `plugin/Cargo.toml`, `plugin/src/lib.rs`, visibility/doc changes in the four core modules, `plugin/tests/core_api.rs`, `xtask/src/main.rs`.
+- [x] V14.1: `cargo check -p deepfilter-vst --locked` (default), `--features plugin`, `--no-default-features`, `--no-default-features --features plugin`, and `--features plugin,nice-plug/assert_process_allocs` all pass on Windows. `cargo tree -p deepfilter-vst --locked -e normal` contains no nice-plug, nice-plug-egui, or egui. Default shape shows only the two pre-existing warnings (`ConverterPlan` private interface, unused `HAS_EMBEDDED_MODEL`); the plugin shape shows six pre-existing bridge/dead-code warnings.
+- [x] V14.2: Default run: 15 library tests plus 2 `core_api` integration tests pass. Plugin run: 32 library tests plus the same 2 integration tests pass. The integration file is compiled as an external crate in both shapes.
+- [x] V14.3: `cargo test -p xtask` passes 3/3. `cargo xtask bundle deepfilter-vst --locked` exits 2 with the guard message before building; `cargo xtask bundle deepfilter-vst --locked --features plugin` exits 0 and creates both `target/bundled` bundles.
+- [x] D14: README, README_ja, and AGENTS build commands now name `plugin`; this tracker records the new build shapes.
+
+Current: I14 complete — plugin layer opt-in, public core API, guarded bundling.
+Next: None for this request. On macOS, a fresh pluginval/package pass is required before any release made from this source; the I13 host and package evidence predates this build-configuration change.
+
+V13 (historical): Complete — recommended dependency upgrades and automated acceptance.
 
 V13.3/D13: Optimized VST3/CLAP build passed on execution 1 in 1m 50s; packaging passed on execution 1 with thin arm64, ad-hoc signatures, ZIP integrity, and SHA-256 verification. Package excludes README media and contains the updated notices. README versions/compiler requirement, changelog, engineering notes, and license notices were reviewed; `git diff --check` passed. Logs: `/private/tmp/deepfilter-upgrade-release.log` and `/private/tmp/deepfilter-upgrade-package.log`.
 Executable SHA-256: `4457eeffad7433d4e6944df1f98a906f1d6f20e06239154c9d98391c9c437d1c`.
@@ -48,7 +56,7 @@ Save this tracker after each implementation step or independent verification uni
 
 Maintain a native Apple Silicon macOS VST3/CLAP noise-reduction plugin with official DeepFilterNet3-LL inference, continuous mono/stereo processing, aligned dry/wet output, complete reset, and a fixed English two-control editor. Real-time, buffered, and offline rendering share one DSP implementation.
 
-The current request is the I13 dependency upgrade scoped above. Preserve the existing DSP architecture and product contracts; revalidate the changed framework and editor integration before producing local release artifacts.
+The latest request is I14: the VST3/CLAP layer builds only with the non-default `plugin` feature, and `dsp`, `model`, `resampler`, and `worker` are the public core API re-exported from `lib.rs`, so the crate is consumable as a library without nice-plug, nice-plug-egui, or egui. I13 remains the most recent dependency upgrade (historical). Preserve the existing DSP architecture and product contracts.
 
 Preserve these product requirements:
 
@@ -64,13 +72,15 @@ Preserve these product requirements:
 
 | Location | Responsibility |
 | --- | --- |
-| `plugin/src/lib.rs`, `params.rs` | nice-plug lifecycle, identity, parameters, Active/Bypass selection, latency reporting |
-| `plugin/src/bridge.rs` | Preallocated host-block accumulation, stereo dry delay, Mix, timestamp/generation matching, mode-specific waiting |
-| `plugin/src/worker.rs` | Persistent worker, bounded SPSC transport, startup/shutdown, reset and fault publication |
-| `plugin/src/model.rs` | Worker-only one-channel `DfTract`, live metadata, pristine-model reconstruction |
-| `plugin/src/resampler.rs`, `dsp.rs` | Persistent rubato conversion, model/raw path, checked latency calculation |
-| `plugin/src/editor.rs` | GUI-only drawing, numeric entry, and host-synchronized parameter gestures |
-| `plugin/Cargo.toml`, `Cargo.lock`, `xtask/` | Pinned dependencies, mutually exclusive model features, bundling |
+| `plugin/src/lib.rs` | Core module declarations and re-exports; the `plugin`-gated lifecycle, identity, Active/Bypass selection, and latency reporting |
+| `plugin/src/params.rs` | (`plugin` feature) Attenuation Limit and Mix parameters |
+| `plugin/src/bridge.rs` | (`plugin` feature) Preallocated host-block accumulation, stereo dry delay, Mix, timestamp/generation matching, mode-specific waiting |
+| `plugin/src/worker.rs` | Public persistent worker, bounded SPSC transport, startup/shutdown, reset and fault publication |
+| `plugin/src/model.rs` | Public one-channel `DfTract` wrapper, live metadata, pristine-model reconstruction |
+| `plugin/src/resampler.rs`, `dsp.rs` | Public persistent rubato conversion, model/raw path, checked latency calculation |
+| `plugin/src/editor.rs` | (`plugin` feature) GUI-only drawing, numeric entry, and host-synchronized parameter gestures |
+| `plugin/tests/core_api.rs` | Integration proof that the core surface is public without the plugin layer |
+| `plugin/Cargo.toml`, `Cargo.lock`, `xtask/` | Pinned dependencies, mutually exclusive model features, `plugin`-guarded bundling |
 | `scripts/package-release.sh` | Non-overwriting local release ZIP and SHA-256 sidecar |
 
 `DfTract`, its pristine clone, model frames, and both converters stay on the worker. The callback must not allocate, lock, wait, log, run inference/resampling, reconstruct the model, or join threads. Initialization is transactional; failure selects direct bypass. Worker startup is bounded to ten seconds. Shutdown joins outside the callback only when finished within its two-second bound, otherwise detaches the isolated worker.

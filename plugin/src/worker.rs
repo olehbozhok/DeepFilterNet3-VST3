@@ -12,7 +12,7 @@ use crate::dsp::{DspCore, DspInfo};
 use crate::model::ModelInfo;
 
 /// Largest host chunk accepted by the fixed worker transport.
-pub(crate) const MAX_HOST_QUANTUM: usize = 1_920;
+pub const MAX_HOST_QUANTUM: usize = 1_920;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -21,7 +21,7 @@ const MAX_QUEUE_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// A timestamped mono chunk moved by value through the SPSC queues.
 #[derive(Clone, Debug)]
-pub(crate) struct AudioChunk {
+pub struct AudioChunk {
     generation: u64,
     start_sample: u64,
     len: usize,
@@ -30,7 +30,7 @@ pub(crate) struct AudioChunk {
 
 impl AudioChunk {
     /// Copy a bounded mono slice into a fixed-size transport message.
-    pub(crate) fn from_slice(
+    pub fn from_slice(
         generation: u64,
         start_sample: u64,
         samples: &[f32],
@@ -50,7 +50,7 @@ impl AudioChunk {
     }
 
     /// Construct a bounded silent message when a caller needs an initialized chunk.
-    pub(crate) fn silence(
+    pub fn silence(
         generation: u64,
         start_sample: u64,
         len: usize,
@@ -66,24 +66,34 @@ impl AudioChunk {
         })
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    /// The generation this chunk belongs to.
+    pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub(crate) fn start_sample(&self) -> u64 {
+    /// The absolute host sample index of the first sample.
+    pub fn start_sample(&self) -> u64 {
         self.start_sample
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Number of valid samples, at most [`MAX_HOST_QUANTUM`].
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn samples(&self) -> &[f32] {
+    /// Whether this chunk carries no samples.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The valid samples.
+    pub fn samples(&self) -> &[f32] {
         debug_assert!(self.is_well_formed());
         &self.samples[..self.len]
     }
 
-    pub(crate) fn set_generation(&mut self, generation: u64) {
+    /// Re-tag this chunk with a newer generation, as overflow recovery does.
+    pub fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
     }
 
@@ -94,9 +104,23 @@ impl AudioChunk {
 
 /// Construction error for an `AudioChunk` that exceeds its fixed capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AudioChunkError {
+pub enum AudioChunkError {
+    /// The payload was longer than [`MAX_HOST_QUANTUM`].
     TooLong,
 }
+
+impl std::fmt::Display for AudioChunkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong => write!(
+                formatter,
+                "audio chunk is longer than the {MAX_HOST_QUANTUM}-sample transport capacity"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AudioChunkError {}
 
 /// Atomics shared between the callback-facing handle and its worker thread.
 #[derive(Debug)]
@@ -172,7 +196,7 @@ impl WorkerControl {
 }
 
 /// A fully handshaken worker with host-owned SPSC endpoints only.
-pub(crate) struct WorkerHandle {
+pub struct WorkerHandle {
     input: Producer<AudioChunk>,
     output: Consumer<AudioChunk>,
     control: Arc<WorkerControl>,
@@ -182,7 +206,7 @@ pub(crate) struct WorkerHandle {
 
 impl WorkerHandle {
     /// Start a worker transactionally. A returned handle always has a live model engine.
-    pub(crate) fn start(
+    pub fn start(
         queue_capacity: usize,
         host_sample_rate: usize,
         max_buffer_size: u32,
@@ -234,24 +258,28 @@ impl WorkerHandle {
         }
     }
 
-    pub(crate) fn model_info(&self) -> ModelInfo {
+    /// The model geometry the worker's engine reports.
+    pub fn model_info(&self) -> ModelInfo {
         self.info.model
     }
 
-    pub(crate) fn dsp_info(&self) -> DspInfo {
+    /// The negotiated geometry and latency.
+    pub fn dsp_info(&self) -> DspInfo {
         self.info
     }
 
-    pub(crate) fn host_quantum(&self) -> usize {
+    /// The size of one exact host chunk.
+    pub fn host_quantum(&self) -> usize {
         self.info.host_quantum
     }
 
-    pub(crate) fn reported_latency(&self) -> u32 {
+    /// The delay a host must align against.
+    pub fn reported_latency(&self) -> u32 {
         self.info.latency.total_host
     }
 
     /// Submit without waiting; a full queue returns ownership of the original message.
-    pub(crate) fn submit(&mut self, chunk: AudioChunk) -> Result<(), SubmitError> {
+    pub fn submit(&mut self, chunk: AudioChunk) -> Result<(), SubmitError> {
         if self.control.is_faulted()
             || self.control.is_discontinuous()
             || self.control.is_stopped()
@@ -266,60 +294,67 @@ impl WorkerHandle {
     }
 
     /// Pop one completed worker result without waiting.
-    pub(crate) fn pop_output(&mut self) -> Result<AudioChunk, PopError> {
+    pub fn pop_output(&mut self) -> Result<AudioChunk, PopError> {
         self.output.pop()
     }
 
     /// Request a reset through atomics only; the worker acknowledges after restoring pristine state.
-    pub(crate) fn request_reset(&self, generation: u64) {
+    pub fn request_reset(&self, generation: u64) {
         self.control.request_reset(generation);
     }
 
     /// Publish attenuation through atomics only.
-    pub(crate) fn set_attenuation(&self, attenuation: f32) {
+    pub fn set_attenuation(&self, attenuation: f32) {
         self.control.set_attenuation(attenuation);
     }
 
-    pub(crate) fn requested_generation(&self) -> u64 {
+    /// The newest generation a producer has requested.
+    pub fn requested_generation(&self) -> u64 {
         self.control.requested_generation()
     }
 
-    pub(crate) fn acknowledged_generation(&self) -> u64 {
+    /// The newest generation the worker has restored.
+    pub fn acknowledged_generation(&self) -> u64 {
         self.control.acknowledged_generation()
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
+    /// Whether the model engine finished initializing.
+    pub fn is_ready(&self) -> bool {
         self.control.is_ready()
     }
 
-    pub(crate) fn is_faulted(&self) -> bool {
+    /// Whether the worker hit an unrecoverable fault.
+    pub fn is_faulted(&self) -> bool {
         self.control.is_faulted()
     }
 
-    pub(crate) fn is_model_faulted(&self) -> bool {
+    /// Whether the model failed during processing; the raw path still produced audio.
+    pub fn is_model_faulted(&self) -> bool {
         self.control.is_model_faulted()
     }
 
-    pub(crate) fn is_discontinuous(&self) -> bool {
+    /// Whether a chunk arrived out of the expected sequence.
+    pub fn is_discontinuous(&self) -> bool {
         self.control.is_discontinuous()
     }
 
-    pub(crate) fn is_stopped(&self) -> bool {
+    /// Whether the worker loop has ended.
+    pub fn is_stopped(&self) -> bool {
         self.control.is_stopped()
     }
 
     /// Publish an offline deadline or bridge integrity fault through an atomic only.
-    pub(crate) fn mark_faulted(&self) {
+    pub fn mark_faulted(&self) {
         self.control.faulted.store(true, Ordering::Release);
     }
 
     /// Stop accepting the current generation after an input queue discontinuity.
-    pub(crate) fn mark_discontinuous(&self) {
+    pub fn mark_discontinuous(&self) {
         self.control.discontinuous.store(true, Ordering::Release);
     }
 
     /// Stop during deactivation/reinitialization/drop; never call this on the audio callback.
-    pub(crate) fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         self.control.stop_requested.store(true, Ordering::Release);
         if let Some(thread) = self.thread.as_ref() {
             thread.thread().unpark();
@@ -338,13 +373,16 @@ impl Drop for WorkerHandle {
 
 /// Immediate submission failure that retains the original fixed-size message.
 #[derive(Debug)]
-pub(crate) enum SubmitError {
+pub enum SubmitError {
+    /// The input queue is full.
     Full(AudioChunk),
+    /// The worker faulted, went discontinuous, or stopped.
     Unavailable(AudioChunk),
 }
 
 impl SubmitError {
-    pub(crate) fn into_chunk(self) -> AudioChunk {
+    /// Recover the message that could not be submitted.
+    pub fn into_chunk(self) -> AudioChunk {
         match self {
             Self::Full(chunk) | Self::Unavailable(chunk) => chunk,
         }
@@ -353,7 +391,7 @@ impl SubmitError {
 
 /// Owned startup failure suitable for selecting the host's bypass state.
 #[derive(Debug)]
-pub(crate) struct WorkerError(String);
+pub struct WorkerError(String);
 
 impl WorkerError {
     fn new(message: impl Into<String>) -> Self {

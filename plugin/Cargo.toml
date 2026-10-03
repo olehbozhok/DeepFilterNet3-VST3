@@ -10,6 +10,12 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["model-ll"]
+# The VST3/CLAP plugin layer: nice-plug lifecycle, parameters, editor, and
+# the host-facing bridge. It is NOT in the default set on purpose - this
+# repository is also consumed as the DeepFilterNet core library, and a
+# core-only build must not pull nice-plug, nice-plug-egui, or egui. Every
+# `cargo xtask bundle` and release build names it explicitly.
+plugin = ["dep:nice-plug", "dep:nice-plug-egui", "dep:egui"]
 # At most one of these, or none.
 #
 #   model-ll         DeepFilterNet's own low-latency model (the default)
@@ -31,9 +37,9 @@ model-shortwave = []
 model-custom = []
 
 [dependencies]
-nice-plug = "=0.4.2"
-nice-plug-egui = "=0.5.1"
-egui = { version = "=0.36.2", default-features = false, features = ["default_fonts"] }
+nice-plug = { version = "=0.4.2", optional = true }
+nice-plug-egui = { version = "=0.5.1", optional = true }
+egui = { version = "=0.36.2", default-features = false, features = ["default_fonts"], optional = true }
 
 df = { git = "https://github.com/Rikorose/DeepFilterNet.git", tag = "v0.5.6", package = "deep_filter", default-features = false, features = ["tract"] }
 

@@ -5,23 +5,34 @@ use crate::resampler::{RateConverter, RateError, RatePlan};
 
 /// Live worker geometry and the checked latency reported to the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DspInfo {
-    pub(crate) model: ModelInfo,
-    pub(crate) host_sample_rate: usize,
-    pub(crate) host_quantum: usize,
-    pub(crate) latency: LatencyBreakdown,
+pub struct DspInfo {
+    /// The model the core was built around.
+    pub model: ModelInfo,
+    /// The rate the host feeds, in hertz.
+    pub host_sample_rate: usize,
+    /// One exact host chunk the core consumes and produces.
+    pub host_quantum: usize,
+    /// Every component of the delay a consumer must align against.
+    pub latency: LatencyBreakdown,
 }
 
 /// Latency components with their sample-rate domain encoded in each field name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LatencyBreakdown {
-    pub(crate) host_to_model_output_delay_model: usize,
-    pub(crate) model_algorithmic_delay_model: usize,
-    pub(crate) model_delay_scaled_host: usize,
-    pub(crate) model_to_host_output_delay_host: usize,
-    pub(crate) core_delay_host: usize,
-    pub(crate) runway_delay_host: usize,
-    pub(crate) total_host: u32,
+pub struct LatencyBreakdown {
+    /// Resampler delay on the way into the model, in model samples.
+    pub host_to_model_output_delay_model: usize,
+    /// The model's own algorithmic delay, in model samples.
+    pub model_algorithmic_delay_model: usize,
+    /// The same model-domain delay scaled to host samples.
+    pub model_delay_scaled_host: usize,
+    /// Resampler delay on the way back to the host, in host samples.
+    pub model_to_host_output_delay_host: usize,
+    /// Model plus resampler delay, without the collection runway.
+    pub core_delay_host: usize,
+    /// The collection runway reserved for scheduling the worker.
+    pub runway_delay_host: usize,
+    /// What a host must be told, for sample-accurate dry/wet alignment.
+    pub total_host: u32,
 }
 
 impl LatencyBreakdown {
@@ -73,12 +84,16 @@ impl LatencyBreakdown {
 
 /// Result that distinguishes recoverable model degradation from fatal DSP geometry errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DspProcessOutcome {
-    pub(crate) model_faulted: bool,
+pub struct DspProcessOutcome {
+    /// The model failed on this chunk; the returned audio is the aligned raw path.
+    pub model_faulted: bool,
 }
 
 /// One persistent host-quantum-to-host-quantum worker pipeline.
-pub(crate) struct DspCore {
+///
+/// It is not `Send`: hold it on the thread that runs inference, exactly as the
+/// worker does.
+pub struct DspCore {
     engine: DfEngine,
     host_to_model: RateConverter,
     model_to_host: RateConverter,
@@ -92,7 +107,7 @@ pub(crate) struct DspCore {
 
 impl DspCore {
     /// Construct all model-rate and host-rate state inside the worker thread.
-    pub(crate) fn new(
+    pub fn new(
         engine: DfEngine,
         host_sample_rate: usize,
         max_buffer_size: u32,
@@ -140,12 +155,13 @@ impl DspCore {
         })
     }
 
-    pub(crate) fn info(&self) -> DspInfo {
+    /// The negotiated geometry and latency this core reports to its consumer.
+    pub fn info(&self) -> DspInfo {
         self.info
     }
 
     /// Convert and process one exact host quantum, returning delayed raw audio on model failure.
-    pub(crate) fn process_chunk(
+    pub fn process_chunk(
         &mut self,
         host_input: &[f32],
         requested_attenuation: f32,
@@ -182,7 +198,7 @@ impl DspCore {
     }
 
     /// Restore fresh model/resampler state before the worker acknowledges a generation reset.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.engine.reset();
         self.host_to_model.reset();
         self.model_to_host.reset();
@@ -228,7 +244,7 @@ fn round_ratio(value: usize, numerator: usize, denominator: usize) -> Result<usi
 
 /// Owned DSP construction or fatal conversion error.
 #[derive(Debug)]
-pub(crate) struct DspError(String);
+pub struct DspError(String);
 
 impl DspError {
     fn new(message: impl Into<String>) -> Self {

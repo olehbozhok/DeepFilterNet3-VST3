@@ -122,7 +122,7 @@ Mix 値 0%、50%、100% はいずれも報告されたレイテンシでピー�
 ```bash
 git clone https://github.com/Shuichi346/DeepFilterNet3-VST3.git
 cd DeepFilterNet3-VST3
-cargo xtask bundle deepfilter-vst --release
+cargo xtask bundle deepfilter-vst --release --features plugin
 ```
 
 生成されるバンドル:
@@ -135,10 +135,12 @@ target/bundled/deepfilter-vst.clap
 デフォルトの低レイテンシモデルの代わりに公式標準モデルをビルドするには:
 
 ```bash
-cargo xtask bundle deepfilter-vst --release --no-default-features --features model-standard
+cargo xtask bundle deepfilter-vst --release --no-default-features --features plugin,model-standard
 ```
 
 モデルフィーチャーは相互排他的です。`model-ll` または `model-standard` のいずれか一方を有効にする必要があります。
+
+VST3/CLAP レイヤー自体は非デフォルトの `plugin` フィーチャーであり、すべての `cargo xtask bundle` コマンドで指定する必要があります。`plugin` なしのビルドは DeepFilterNet コアライブラリ（`dsp`、`model`、`resampler`、`worker` と `DspCore`、`DfEngine`、`RatePlan`、`WorkerHandle`）で、nice-plug、nice-plug-egui、egui は依存グラフに含まれません。別のプロジェクトは `default-features = false` で依存し、モデルフィーチャーを明示的に選択します（なしの場合は実行時に `DEEPFILTER_MODEL` を読み込みます）。
 
 ## インストール
 
@@ -182,7 +184,7 @@ cp -R target/bundled/deepfilter-vst.clap "$HOME/Library/Audio/Plug-Ins/CLAP/"
 nice-plug のコールバックアロケーションアサーション付きのデバッグバンドルをビルドします:
 
 ```bash
-cargo xtask bundle deepfilter-vst --features nice-plug/assert_process_allocs
+cargo xtask bundle deepfilter-vst --features plugin,nice-plug/assert_process_allocs
 ```
 
 バウンドされたライブラリおよびプラグイン検証ゲートを実行します:
@@ -222,15 +224,16 @@ ZIP ファイルには両方のプラグインバンドル、インストール�
 ## プロジェクト構造
 
 ```text
-plugin/src/lib.rs        プラグインメタデータ、ライフサイクル、ホストレイアウト、エクスポート
-plugin/src/params.rs     Attenuation Limit と Mix パラメータ
-plugin/src/editor.rs     固定サイズ英語 2 スライダーカスタムエディタ
-plugin/src/bridge.rs     コールバック側バッファリング、アライメント、フォールバック
-plugin/src/dsp.rs        ワーカー DSP コアとレイテンシ計算
-plugin/src/model.rs      DeepFilterNet モデルラッパーとメタデータ
-plugin/src/resampler.rs  検証済み永続サンプルレート変換
-plugin/src/worker.rs     ワーカーライフサイクル、キュー、リセット、ステータス
-xtask/                   VST3/CLAP バンドルコマンド
+plugin/src/lib.rs        コアの公開 API と、ゲートされたプラグインメタデータ、ライフサイクル、ホストレイアウト
+plugin/src/params.rs     Attenuation Limit と Mix パラメータ（plugin フィーチャー）
+plugin/src/editor.rs     固定サイズ英語 2 スライダーカスタムエディタ（plugin フィーチャー）
+plugin/src/bridge.rs     コールバック側バッファリング、アライメント、フォールバック（plugin フィーチャー）
+plugin/src/dsp.rs        公開ワーカー DSP コアとレイテンシ計算
+plugin/src/model.rs      公開 DeepFilterNet モデルラッパーとメタデータ
+plugin/src/resampler.rs  公開検証済み永続サンプルレート変換
+plugin/src/worker.rs     公開ワーカーライフサイクル、キュー、リセット、ステータス
+plugin/tests/core_api.rs プラグインレイヤーなしでコア API が使えることの検証
+xtask/                   ガード付き VST3/CLAP バンドルコマンド
 scripts/                 リリースパッケージングツール
 ```
 
@@ -242,7 +245,7 @@ scripts/                 リリースパッケージングツール
 
 ```bash
 cargo clean
-cargo xtask bundle deepfilter-vst --release
+cargo xtask bundle deepfilter-vst --release --features plugin
 ```
 
 VST3 または CLAP ディレクトリが上記のインストールパスと一致していることを確認し、ホストを再起動またはスキャンし直してください。ローカルビルドのバンドルは Developer ID 署名や公証がされていないため、macOS のホストセキュリティの動作が配布済み署名プラグインと異なる場合があります。

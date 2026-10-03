@@ -26,6 +26,12 @@
 
 ### Changed
 
+- Moved the VST3/CLAP layer (`bridge`, `editor`, `params`, and the plugin
+  lifecycle) behind the non-default `plugin` feature. The default build is the
+  core library with a public `DspCore`/`DfEngine`/`RatePlan`/`WorkerHandle`
+  API and no nice-plug, nice-plug-egui, or egui dependency. Every
+  `cargo xtask bundle` now names `--features plugin`, and `xtask` refuses a
+  bundle that does not.
 - Upgraded nice-plug to 0.4.2, nice-plug-egui to 0.5.1, egui to 0.36.2,
   rtrb to 0.3.5, and log to 0.4.34. Migrated activation and editor integration
   while preserving plugin identities, DSP behavior, and the fixed two-control UI.

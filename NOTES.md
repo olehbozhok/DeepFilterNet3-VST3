@@ -1,5 +1,39 @@
 # Notes
 
+## 2026-10-03
+
+- Split the crate into a default core and an opt-in plugin layer on branch
+  `plugin-feature-gate`. `plugin = ["dep:nice-plug", "dep:nice-plug-egui",
+  "dep:egui"]` gates `bridge`, `editor`, `params`, and the
+  `Plugin`/`ClapPlugin`/`Vst3Plugin` impls in `lib.rs`; the plugin code stays
+  in place with item-level `#[cfg]` attributes rather than moving to a new
+  file, so future upstream edits to `lib.rs` merge as ordinary line changes
+  and a whole-file move cannot turn every upstream change into a conflict.
+- The four core modules are public: `DspCore`, `DspInfo`, `LatencyBreakdown`,
+  `DspError`, `DfEngine`, `ModelInfo`, `ModelError`, `ModelSource`,
+  `RatePlan`, `RateError`, `WorkerHandle`, `AudioChunk`, `AudioChunkError`,
+  `SubmitError`, `WorkerError`, `MAX_HOST_QUANTUM`, `MODEL_SAMPLE_RATE`,
+  `MODEL_HOP_SIZE`, and `MODEL_PATH_ENV`. `AudioChunk` grew `is_empty` for the
+  clippy `len_without_is_empty` convention, and `AudioChunkError` implements
+  `Display`/`Error` like the other public errors. Visibility and docs are the
+  only behavior-neutral change to those modules.
+- `xtask` gained a guard because `nice-plug-xtask` treats "no exported plugin"
+  as success: it prints "Not creating any plugin bundles" and exits 0, which
+  would let `scripts/package-release.sh` package stale bundles. A `bundle` or
+  `bundle-universal` invocation without `plugin` (in any cargo spelling) now
+  exits 2 before building; unit tests cover the spellings.
+- Verification on Windows: default check, `--features plugin`,
+  `--no-default-features`, `--no-default-features --features plugin`, and
+  `--features plugin,nice-plug/assert_process_allocs` all pass; `cargo tree`
+  shows no nice-plug/egui in the default graph; 15 default + 32 plugin library
+  tests and the 2 external `core_api` tests pass; `cargo xtask bundle` with
+  `plugin` creates both bundles and without it exits 2. Default build keeps
+  only the two pre-existing warnings, the plugin build the six pre-existing
+  bridge/dead-code warnings.
+- Limit: no macOS pluginval, paced-host, manual Resolve, or package evidence
+  was produced for this build-configuration change, so a fresh macOS pass is
+  required before any release from this source.
+
 ## 2026-09-26
 
 - Upgraded nice-plug/nice-plug-egui together to 0.4.2/0.5.1 and egui to

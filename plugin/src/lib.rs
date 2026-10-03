@@ -18,33 +18,54 @@ compile_error!(
     "enable at most one of model-ll, model-standard, model-shortwave, model-custom"
 );
 
+#[cfg(feature = "plugin")]
 mod bridge;
-mod dsp;
+pub mod dsp;
+#[cfg(feature = "plugin")]
 mod editor;
-mod model;
+pub mod model;
+#[cfg(feature = "plugin")]
 mod params;
-mod resampler;
-mod worker;
+pub mod resampler;
+pub mod worker;
 
+// The core API, usable without the VST3/CLAP layer. Consumers of the
+// `plugin`-less default build depend on these names; the plugin modules above
+// stay private.
+pub use dsp::{DspCore, DspError, DspInfo, DspProcessOutcome, LatencyBreakdown};
+pub use model::{
+    DfEngine, ModelError, ModelInfo, ModelSource, MODEL_HOP_SIZE, MODEL_PATH_ENV,
+    MODEL_SAMPLE_RATE,
+};
+pub use resampler::{RateError, RatePlan};
+pub use worker::{
+    AudioChunk, AudioChunkError, SubmitError, WorkerError, WorkerHandle, MAX_HOST_QUANTUM,
+};
+
+#[cfg(feature = "plugin")]
 use std::sync::Arc;
 
+#[cfg(feature = "plugin")]
 use bridge::{BridgeConfig, HostBridge};
+#[cfg(feature = "plugin")]
 use nice_plug::prelude::*;
+#[cfg(feature = "plugin")]
 use params::DeepFilterParams;
-use resampler::RatePlan;
-use worker::WorkerHandle;
 
+#[cfg(feature = "plugin")]
 enum ProcessingState {
     Active(HostBridge),
     Bypass,
 }
 
+#[cfg(feature = "plugin")]
 struct DeepFilterPlugin {
     params: Arc<DeepFilterParams>,
     editor_state: Arc<nice_plug_egui::EguiEditorState>,
     processing: ProcessingState,
 }
 
+#[cfg(feature = "plugin")]
 impl Default for DeepFilterPlugin {
     fn default() -> Self {
         Self {
@@ -55,6 +76,7 @@ impl Default for DeepFilterPlugin {
     }
 }
 
+#[cfg(feature = "plugin")]
 impl Plugin for DeepFilterPlugin {
     const NAME: &'static str = "DeepFilter Noise Reduction";
     const VENDOR: &'static str = "DeepFilterNet";
@@ -198,6 +220,7 @@ impl Plugin for DeepFilterPlugin {
     }
 }
 
+#[cfg(feature = "plugin")]
 impl DeepFilterPlugin {
     fn shutdown_active(&mut self) {
         let processing = std::mem::replace(&mut self.processing, ProcessingState::Bypass);
@@ -207,6 +230,7 @@ impl DeepFilterPlugin {
     }
 }
 
+#[cfg(feature = "plugin")]
 fn selected_channels(layout: &AudioIOLayout) -> Option<usize> {
     let input = usize::try_from(layout.main_input_channels?.get()).ok()?;
     let output = usize::try_from(layout.main_output_channels?.get()).ok()?;
@@ -217,6 +241,7 @@ fn selected_channels(layout: &AudioIOLayout) -> Option<usize> {
     }
 }
 
+#[cfg(feature = "plugin")]
 fn valid_sample_rate(sample_rate: f32) -> Option<usize> {
     if !sample_rate.is_finite()
         || sample_rate <= 0.0
@@ -229,6 +254,7 @@ fn valid_sample_rate(sample_rate: f32) -> Option<usize> {
     Some(sample_rate as usize)
 }
 
+#[cfg(feature = "plugin")]
 impl ClapPlugin for DeepFilterPlugin {
     const CLAP_ID: &'static str = "com.deepfilter.noise-reduction";
     const CLAP_DESCRIPTION: Option<&'static str> = Some("Noise reduction using DeepFilterNet3");
@@ -237,6 +263,7 @@ impl ClapPlugin for DeepFilterPlugin {
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Stereo];
 }
 
+#[cfg(feature = "plugin")]
 impl Vst3Plugin for DeepFilterPlugin {
     const VST3_CLASS_ID: [u8; 16] = *b"DeepFilterNR001\0";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
@@ -245,7 +272,9 @@ impl Vst3Plugin for DeepFilterPlugin {
     ];
 }
 
+#[cfg(feature = "plugin")]
 nice_export_clap!(DeepFilterPlugin);
+#[cfg(feature = "plugin")]
 nice_export_vst3!(DeepFilterPlugin);
 
 #[cfg(test)]
@@ -282,7 +311,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "plugin"))]
 mod tests {
     use std::cell::Cell;
 
