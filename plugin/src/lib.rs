@@ -41,7 +41,7 @@ enum ProcessingState {
 
 struct DeepFilterPlugin {
     params: Arc<DeepFilterParams>,
-    editor_state: Arc<nice_plug_egui::EguiState>,
+    editor_state: Arc<nice_plug_egui::EguiEditorState>,
     processing: ProcessingState,
 }
 
@@ -80,20 +80,21 @@ impl Plugin for DeepFilterPlugin {
 
     type SysExMessage = ();
     type BackgroundTask = ();
+    type Editor = nice_plug_egui::EguiEditor<editor::DeepFilterEditor>;
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
 
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
         editor::create(self.params.clone(), self.editor_state.clone())
     }
 
-    fn initialize(
+    fn activate(
         &mut self,
         audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        context: &mut impl InitContext<Self>,
+        context: &mut impl ActivateContext<Self>,
     ) -> bool {
         self.shutdown_active();
         context.set_latency_samples(0);
@@ -116,6 +117,7 @@ impl Plugin for DeepFilterPlugin {
         let Ok(worker) = WorkerHandle::start(
             queue_capacity,
             sample_rate,
+            buffer_config.max_buffer_size,
             0,
             self.params.atten_lim.value(),
         ) else {
@@ -156,7 +158,12 @@ impl Plugin for DeepFilterPlugin {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let attenuation = self.params.atten_lim.smoothed.next();
+        let samples = buffer.samples();
+        if samples == 0 {
+            return ProcessStatus::Normal;
+        }
+        // Smoother steps are audio samples, not host callbacks.
+        let attenuation = self.params.atten_lim.smoothed.next_step(samples as u32);
         let mix = &self.params.mix;
         let channels = buffer.as_slice();
 
@@ -281,11 +288,11 @@ mod tests {
 
     use super::*;
 
-    struct TestInitContext {
+    struct TestActivateContext {
         latency: Cell<u32>,
     }
 
-    impl TestInitContext {
+    impl TestActivateContext {
         fn new() -> Self {
             Self {
                 latency: Cell::new(u32::MAX),
@@ -293,7 +300,7 @@ mod tests {
         }
     }
 
-    impl InitContext<DeepFilterPlugin> for TestInitContext {
+    impl ActivateContext<DeepFilterPlugin> for TestActivateContext {
         fn plugin_api(&self) -> PluginApi {
             PluginApi::Vst3
         }
@@ -336,7 +343,14 @@ mod tests {
             None
         }
 
-        fn send_event(&mut self, _event: PluginNoteEvent<DeepFilterPlugin>) {}
+        fn try_send_event(
+            &mut self,
+            event: PluginNoteEvent<DeepFilterPlugin>,
+        ) -> Result<(), (PluginNoteEvent<DeepFilterPlugin>, nice_plug::context::process::SendEventError)> {
+            Err((event, nice_plug::context::process::SendEventError::NoOutputBuffer))
+        }
+
+        fn request_restart(&self) {}
 
         fn set_latency_samples(&self, _samples: u32) {}
 
@@ -345,9 +359,9 @@ mod tests {
 
     fn assert_initialization_falls_back_to_direct_bypass(config: BufferConfig) {
         let mut plugin = DeepFilterPlugin::default();
-        let context = TestInitContext::new();
+        let context = TestActivateContext::new();
         let mut context = context;
-        assert!(plugin.initialize(
+        assert!(plugin.activate(
             &DeepFilterPlugin::AUDIO_IO_LAYOUTS[0],
             &config,
             &mut context,
@@ -400,11 +414,41 @@ mod tests {
     }
 
     #[test]
+    fn attenuation_transition_uses_audio_time_for_every_block_size() {
+        for block_size in [1, 7, 128, 512, 1024, 4096] {
+            let mut plugin = DeepFilterPlugin::default();
+            plugin.params.atten_lim.smoothed.reset(100.0);
+            plugin.params.atten_lim.smoothed.set_target(48_000.0, 0.0);
+            let mut audio = vec![0.25; block_size];
+            let mut buffer = Buffer::default();
+            unsafe {
+                buffer.set_slices(block_size, |slices| {
+                    slices.clear();
+                    slices.push(audio.as_mut_slice());
+                });
+            }
+            let mut inputs = [];
+            let mut outputs = [];
+            let mut auxiliary = AuxiliaryBuffers { inputs: &mut inputs, outputs: &mut outputs };
+            let mut context = TestProcessContext::new(48_000.0);
+            let mut elapsed = 0;
+            while elapsed < 2400 {
+                plugin.process(&mut buffer, &mut auxiliary, &mut context);
+                elapsed += block_size;
+                let expected = 100.0 * (1.0 - (elapsed as f32 / 2400.0).min(1.0));
+                assert!((plugin.params.atten_lim.smoothed.previous_value() - expected).abs() < 0.01,
+                    "block {block_size} must advance smoothing by its sample count");
+            }
+            assert_eq!(plugin.params.atten_lim.smoothed.previous_value(), 0.0);
+        }
+    }
+
+    #[test]
     fn custom_editor_is_fixed_and_compact() {
         let mut plugin = DeepFilterPlugin::default();
         let executor = AsyncExecutor::new(Arc::new(|_| {}), Arc::new(|_| {}));
         let editor = plugin.editor(executor).expect("custom editor should exist");
-        let size = editor.size().to_logical::<f32>(1.0);
+        let size = editor.size().cast::<f32>().to_logical(1.0);
 
         assert_eq!(size.width, editor::EDITOR_WIDTH);
         assert_eq!(size.height, editor::EDITOR_HEIGHT);

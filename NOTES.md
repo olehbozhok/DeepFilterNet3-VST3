@@ -1,5 +1,69 @@
 # Notes
 
+## 2026-09-26
+
+- Upgraded nice-plug/nice-plug-egui together to 0.4.2/0.5.1 and egui to
+  0.36.2, with rtrb 0.3.5 and log 0.4.34 maintenance updates. The framework
+  uses `activate`/`ActivateContext` and a concrete editor type; the GUI uses
+  `NiceEguiApp` with host-driven repaint notifications and GUI-only parameter
+  setters. GUI build resets temporary editing state when the window reopens.
+- Selected rtrb 0.3.5 as the compatible maintenance update rather than the
+  breaking 0.4 series. The worker continued to use individual push/pop operations.
+- Retained DeepFilterNet 0.5.6, ndarray 0.15.6, Tract 0.19.16, and rubato
+  0.14.1 to preserve the existing inference/resampling compatibility boundary.
+  Rust 1.95 is required by the updated egui dependency; validation used 1.98.1.
+- Confirmed all four embedded font license texts were unchanged in
+  epaint_default_fonts 0.36.2. Updated harfrust attribution and added try-lock's
+  MIT notice; removed the no-longer-resolved memoffset entry.
+- All 31 library tests and allocation-asserting pluginval strictness 5 passed
+  after the upgrade. Optimized VST3/CLAP bundles were packaged with verified
+  arm64 architecture, ad-hoc signatures, ZIP integrity, and SHA-256 output.
+- Dependency-upgrade acceptance and artifact provenance are tracked under
+  I13/V13 in `PLANS.md`. The plugin remained version 0.7.0; the package used
+  the `0.7.0-deps-20260926` suffix to preserve the previous archive. This build
+  was neither installed nor published. Existing installed binaries, paced-host
+  probe measurements, and Resolve evidence predated this migration.
+
+- Updated the plugin from 0.6.0 to 0.7.0, rebuilt both formats, and confirmed
+  the actual exported plugin descriptor reports 0.7.0. The bundler's generic
+  Info.plist version is independent of the host-facing plugin VERSION.
+- Created the verified v0.7.0 ZIP and checksum sidecar, and installed its VST3
+  with the previous installed bundle preserved in `dist/installed-backup-before-v070/`.
+  DSP and dependencies were unchanged, so the existing behavioral evidence was reused.
+
+- Plan maintenance removed duplicate trackers, superseded instructions, and
+  repeated acceptance gates. `PLANS.md` retained current design and acceptance
+  evidence; historical construction details remained in Git and these notes.
+- Review retained all 31 Rust tests because they covered distinct failure
+  cases. The cleanup changed documentation only; existing binary evidence
+  remained applicable, so no rebuild or code-test rerun was needed.
+- The operational audit reproduced callback-counted attenuation smoothing,
+  dry substitution at 1024/4096-sample callbacks, and latched dry-only output
+  after input overflow. Historical pluginval success did not detect these.
+- Attenuation now advances the existing smoother by the callback's sample
+  count. Parameter automation remains block-based; the nominal ramp is 50 ms.
+- Worker runway now covers the negotiated maximum callback rounded up to a
+  quantum, plus one inference quantum. At 48 kHz, maxima of 128/512/1024/4096
+  samples report 1440/1920/2400/5280 samples of total latency respectively.
+- Overflow recovery starts a new generation at the newest complete chunk,
+  preserves absolute host counters and the stereo dry ring, and masks reset
+  model/resampler history with aligned dry until it is valid.
+- All 31 library tests passed, including new parameter-duration, runway, and
+  recovery regressions. At maximum block 1024, measured impulse latency was
+  2646/2400/4800 samples at 44.1/48/96 kHz, with the declared one-sample
+  tolerance for conversion. Release/host evidence is tracked in PLANS.md.
+- Allocation-asserting pluginval strictness 5 completed with SUCCESS. The
+  optimized release probe measured zero dry substitutions at paced 48 kHz
+  blocks of 128/512/1024/4096, a transparent 0 dB path by 100 ms after the
+  change plus reported latency, and enhancement recovery within one second
+  after a forced queue overrun. Enhanced offline speech at 44.1/48/96 kHz
+  remained non-silent and bit-identical after reset. These are bounded host
+  measurements, not a guarantee against arbitrary OS scheduling stalls.
+- The verified release was packaged as `dist/DeepFilterNR-v0.6.0-fix-20260926-macos-arm64.zip`
+  with its SHA-256 sidecar. With separate installation approval, the user VST3
+  was replaced and the previous bundle retained under
+  `dist/installed-backup-20260926/`. Running hosts must reload to use the new binary.
+
 ## 2026-08-12
 
 - The plug-in now defines a fixed 420 × 190 logical-pixel custom editor using

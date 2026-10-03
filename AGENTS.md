@@ -9,13 +9,23 @@ Project instructions for coding agents working in this repository.
 - Preserve the plugin name, CLAP ID `com.deepfilter.noise-reduction`, VST3
   class ID `DeepFilterNR001\0`, and parameter IDs `atten_lim` and `mix` unless
   the user explicitly authorizes an identity migration.
-- Respect the verification budgets and green-stop state in `PLANS.md`. A
-  code, manifest, or configuration change invalidates the final release and
-  deferred manual-host evidence; revise the plan before rerunning acceptance.
+- Follow the change-specific verification and retry budgets in `PLANS.md`;
+  stop once affected acceptance passes. Completed historical gates are not
+  prerequisites for unrelated maintenance. Production source, manifest, or
+  build-configuration changes invalidate affected release/manual-host evidence;
+  test-only edits invalidate affected test evidence, while documentation-only
+  edits do not invalidate binaries. Revise the plan before new acceptance work.
 
 ## DSP and build invariants
 
 - Use nice-plug and nice-plug-xtask. Do not reintroduce nih-plug.
+- Keep nice-plug, nice-plug-egui, and egui on compatible versions when updating
+  `plugin/Cargo.toml` and `Cargo.lock`. The current editor requires Rust 1.95
+  or later. Use `Plugin::activate`/`ActivateContext` and the concrete
+  `Plugin::Editor` associated type for the current framework.
+- Treat DeepFilterNet, ndarray, Tract, and rubato as a shared compatibility
+  boundary; assess model APIs and resampling/latency behavior before upgrading
+  them independently.
 - Enable AT MOST one embedded model feature; a build with none is legal and
   deliberate. The four shapes:
 
@@ -45,6 +55,12 @@ Project instructions for coding agents working in this repository.
 - Preserve timestamp and generation matching, per-channel latency-aligned dry
   fallback, and the single shared DSP path for real-time, buffered, and
   offline modes. Only Offline may wait, and its wait must remain bounded.
+- Derive collection runway from the negotiated maximum host block plus one
+  model quantum. Keep it in reported latency and both output timelines;
+  deterministic immediate-worker tests alone do not prove real-time coverage.
+- Advance parameter smoothing in audio-sample time. On input queue overflow,
+  restart the worker generation without resetting host counters or dry delay,
+  and keep aligned dry until the new model/resampler history becomes valid.
 - Continue model advancement at an effectively zero attenuation setting while
   selecting the aligned raw path. Do not use DeepFilterNet's immediate
   zero-attenuation return as host output.
@@ -60,6 +76,9 @@ Project instructions for coding agents working in this repository.
   controls unless the user explicitly expands the UI scope.
 - Keep GUI work outside the audio callback and route slider gestures through
   nice-plug's parameter setter so host automation remains synchronized.
+- In `plugin/src/editor.rs`, preserve the `NiceEguiApp` lifecycle and the
+  framework's `RepaintNotifier` integration so host automation repaints the UI.
+  Reset temporary text-entry and drag state when the editor is reopened.
 
 ## Release packaging
 

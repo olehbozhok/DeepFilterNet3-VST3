@@ -64,16 +64,16 @@ The plug-in bypassed and enabled:
 | Component | Role |
 | :--- | :--- |
 | Rust 2021 workspace | Plugin, DSP bridge, tests, and bundle task |
-| [nice-plug 0.2.3](https://codeberg.org/RustAudio/nice-plug) | VST3/CLAP framework and exports |
-| [nice-plug-egui 0.3.0](https://codeberg.org/RustAudio/nice-plug/src/branch/main/crates/nice-plug-egui) / [egui 0.35.0](https://github.com/emilk/egui/tree/0.35.0) | Embedded two-slider custom editor |
+| [nice-plug 0.4.2](https://codeberg.org/RustAudio/nice-plug) | VST3/CLAP framework and exports |
+| [nice-plug-egui 0.5.1](https://codeberg.org/RustAudio/nice-plug/src/branch/main/crates/nice-plug-egui) / [egui 0.36.2](https://github.com/emilk/egui/tree/0.36.2) | Embedded two-slider custom editor |
 | [DeepFilterNet 0.5.6](https://github.com/Rikorose/DeepFilterNet/tree/v0.5.6) | Official embedded model and Tract inference |
 | [rubato 0.14.1](https://github.com/HEnquist/rubato/tree/v0.14.1) | Persistent fixed-size sample-rate conversion |
-| [rtrb 0.3.3](https://github.com/mgeier/rtrb/tree/0.3.3) | Lock-free worker queues |
+| [rtrb 0.3.5](https://github.com/mgeier/rtrb/tree/0.3.5) | Lock-free worker queues |
 
 ## Current validation scope
 
 The current implementation is built and tested on Apple Silicon with macOS
-26. Automated validation includes 25 Rust tests and pluginval strictness 5
+26. Automated validation includes 31 Rust tests and pluginval strictness 5
 with callback allocation assertions. pluginval opened the custom editor both
 idle and during processing, exercised editor automation plus 44.1, 48, and 96
 kHz processing, and completed with `SUCCESS`.
@@ -96,24 +96,30 @@ The embedded model always receives one channel:
 
 The plugin delays both dry and wet output to the reported latency. During startup or a real-time worker underrun, the affected samples use dry audio from the same delayed timestamp instead of silence or a stale wet frame. Offline mode uses the same worker pipeline and may wait up to two seconds for the required timestamped result.
 
+If sustained overload exhausts the input queue, the worker automatically restarts from recent audio. The dry timeline stays continuous during recovery; enhancement resumes when valid results are available again.
+
 Unsupported sample-rate or host-buffer geometry, model startup failure, and other initialization failures select unchanged direct bypass with zero reported latency.
 
 ## Latency
 
-Latency is calculated from live model metadata, both resamplers, and two host quanta reserved for nonblocking collection and inference. The official low-latency model reports a 48 kHz FFT size of 960, hop size of 480, zero lookahead, and 480 samples of intrinsic model delay.
+Latency is calculated from live model metadata, both resamplers, and the host's maximum block size. The collection/inference reserve is `(ceil(maximum block size / host quantum) + 1) * host quantum`, so a full callback can be queued without immediately requiring its results. Latency stays fixed until reinitialization and is reported to the host for compensation. The official low-latency model has a 48 kHz FFT size of 960, hop size of 480, zero lookahead, and 480 samples of intrinsic model delay.
+
+The following impulse results use a negotiated maximum block size of **1024 samples**:
 
 | Host rate | Host quantum | Reported latency | Impulse validation |
 | ---: | ---: | ---: | :--- |
-| 44.1 kHz | 441 samples | 1,764 samples (40 ms) | Within 1 sample |
-| 48 kHz | 480 samples | 1,440 samples (30 ms) | Exact |
-| 96 kHz | 960 samples | 3,840 samples (40 ms) | Within 1 sample |
+| 44.1 kHz | 441 samples | 2,646 samples (60 ms) | Within 1 sample |
+| 48 kHz | 480 samples | 2,400 samples (50 ms) | Exact |
+| 96 kHz | 960 samples | 4,800 samples (50 ms) | Within 1 sample |
 
 Mix values of 0%, 50%, and 100% remain peak-aligned at the reported latency. The other declared rates use the same checked formula and streaming converter geometry.
+
+At 48 kHz, maximum blocks of 128, 512, and 4096 samples report 30, 40, and 110 ms respectively. The host's negotiated maximum, not merely the size of the current callback, determines the reserve.
 
 ## Requirements
 
 - Apple Silicon Mac running macOS 26.x or later for the validated configuration.
-- Rust 1.87 or later to build nice-plug 0.2.3.
+- Rust 1.95 or later to build the pinned framework and egui dependencies.
 - A VST3- or CLAP-compatible host.
 
 The build downloads Rust dependencies and the pinned official DeepFilterNet v0.5.6 source/model archive.
@@ -179,7 +185,7 @@ changes remain synchronized with the sliders.
 
 | Parameter | Range | Default | Behavior |
 | :--- | ---: | ---: | :--- |
-| Attenuation Limit | 0–100 dB | 100 dB | Limits the attenuation applied by DeepFilterNet. At effectively 0 dB, the model still advances while the aligned raw path is selected. |
+| Attenuation Limit | 0–100 dB | 100 dB | Limits the attenuation applied by DeepFilterNet, with 50 ms smoothing advanced in audio-sample time and applied per callback. At effectively 0 dB, the model still advances while the aligned raw path is selected. |
 | Mix | 0–100% | 100% | Blends latency-aligned per-channel dry audio with the mono wet result. |
 
 ## Development and testing
@@ -212,14 +218,14 @@ cargo xtask bundle deepfilter-vst --release
 The script reads the version from `plugin/Cargo.toml`. You can also pass an explicit version:
 
 ```bash
-./scripts/package-release.sh 0.5.0
+./scripts/package-release.sh 0.7.0
 ```
 
 It verifies that both bundles are thin arm64 binaries with valid ad-hoc signatures, then creates:
 
 ```text
-dist/DeepFilterNR-v0.5.0-macos-arm64.zip
-dist/DeepFilterNR-v0.5.0-macos-arm64.zip.sha256
+dist/DeepFilterNR-v0.7.0-macos-arm64.zip
+dist/DeepFilterNR-v0.7.0-macos-arm64.zip.sha256
 ```
 
 The ZIP contains both plug-in bundles, installation instructions, required
